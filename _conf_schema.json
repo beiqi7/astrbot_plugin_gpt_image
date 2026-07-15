@@ -1,0 +1,169 @@
+{
+  "base_url": {
+    "description": "adobe2api 服务地址",
+    "type": "string",
+    "hint": "例如 http://127.0.0.1:6001 或 https://your-adobe2api.example.com（不要带末尾斜杠）",
+    "default": "http://127.0.0.1:6001",
+    "obvious_hint": true
+  },
+  "api_key": {
+    "description": "adobe2api API Key",
+    "type": "string",
+    "hint": "对应 adobe2api config.json 中的 api_key，请求时使用 Bearer 鉴权",
+    "default": "",
+    "obvious_hint": true
+  },
+  "daily_limit": {
+    "description": "普通用户每日生图次数",
+    "type": "int",
+    "hint": "每个自然日（东八区）可成功生图的次数。默认 5。设为 0 表示禁止普通用户；全局管理员不受此限制",
+    "default": 5,
+    "obvious_hint": true
+  },
+  "max_ref_images": {
+    "description": "改图/图生图最多参考图数量",
+    "type": "int",
+    "hint": "同消息或引用消息中提取的参考图上限，默认 3，最大 8",
+    "default": 3,
+    "obvious_hint": true
+  },
+  "default_resolution": {
+    "description": "生图分辨率",
+    "type": "string",
+    "hint": "resolution_mode=fixed 时始终用该值；=llm 时作为 LLM 未给出结果的回退。比例（aspect_ratio）始终由 LLM 决定。",
+    "default": "2k",
+    "options": [
+      "1k",
+      "2k",
+      "4k"
+    ],
+    "obvious_hint": true
+  },
+  "resolution_mode": {
+    "description": "分辨率决策方式",
+    "type": "string",
+    "hint": "fixed=固定为 default_resolution（推荐）；llm=让 LLM 根据 prompt 自动挑 1k/2k/4k。比例始终由 LLM 决定，不受此项影响。",
+    "default": "fixed",
+    "options": [
+      "fixed",
+      "llm"
+    ],
+    "obvious_hint": true
+  },
+  "default_aspect_ratio": {
+    "description": "默认画幅比例（LLM 失败时回退）",
+    "type": "string",
+    "hint": "GPT Image 支持：1:1 / 5:4 / 9:16 / 21:9 / 16:9 / 4:3 / 3:2 / 4:5 / 3:4 / 2:3",
+    "default": "1:1",
+    "options": [
+      "1:1",
+      "5:4",
+      "9:16",
+      "21:9",
+      "16:9",
+      "4:3",
+      "3:2",
+      "4:5",
+      "3:4",
+      "2:3"
+    ],
+    "obvious_hint": true
+  },
+  "auto_select_size": {
+    "description": "用 LLM 自动选择分辨率与比例",
+    "type": "bool",
+    "hint": "开启后会先调用当前对话模型分析 prompt，选出最合适的 1k/2k/4k 与画幅",
+    "default": true,
+    "obvious_hint": true
+  },
+  "enable_audit": {
+    "description": "启用输入审核",
+    "type": "bool",
+    "hint": "开启后按下方审核提示词（及可选关键词预检）检查用户描述",
+    "default": true,
+    "obvious_hint": true
+  },
+  "enable_keyword_filter": {
+    "description": "启用关键词预检",
+    "type": "bool",
+    "hint": "政治敏感词硬拦截（含东突及变体、拆字插符）。建议保持开启。",
+    "default": true,
+    "obvious_hint": true
+  },
+  "audit_provider_id": {
+    "description": "审核 / 尺寸选择使用的独立 LLM 提供商 ID",
+    "type": "string",
+    "hint": "留空则使用当前会话正在使用的模型。建议指定一个响应快的小模型（如 4B/8B），可显著减少生图前的等待时间。可在 AstrBot WebUI → 服务提供商 处查看/新增提供商，复制 provider_id 填入。",
+    "default": "",
+    "_special": "select_provider",
+    "obvious_hint": true
+  },
+  "audit_prompt": {
+    "description": "审核 / 规划系统提示词",
+    "type": "text",
+    "hint": "LLM 审核+选尺寸的 system prompt。默认：政治从严、娱乐明星放行。输出 JSON：allowed/reason/resolution/aspect_ratio。留空用内置默认。",
+    "default": "你是图片生成请求的「审核 + 模型参数选择」助手。只输出一个 JSON 对象，不要 Markdown，不要解释。\n\n职责边界（必须遵守）：\n1. 审核用户描述是否允许生成（审核重点是政治安全，不是娱乐尺度）。\n2. 根据画面意图选择 resolution 与 aspect_ratio。\n3. 禁止改写、翻译、润色、扩写用户原文。系统会把用户原文原样作为生图 prompt。\n4. 不要输出任何用于生图的 prompt 正文（不要 cleaned_prompt 等字段）。\n\n输出 JSON schema（仅这些字段）：\n{\n  \"allowed\": true/false,\n  \"reason\": \"若拒绝，用简短中文说明原因；通过可为空字符串\",\n  \"resolution\": \"1k\" | \"2k\" | \"4k\",\n  \"aspect_ratio\": \"1:1\" | \"5:4\" | \"9:16\" | \"21:9\" | \"16:9\" | \"4:3\" | \"3:2\" | \"4:5\" | \"3:4\" | \"2:3\"\n}\n\n【必须拒绝 — 政治 / 分裂 / 暴恐 / 邪教】（从严，宁可误杀政治内容）：\n- 中国大陆现任或历任国家领导人、政治局常委等真实形象、恶搞、讽刺、色情化。\n- 分裂国家与极端组织：台独、藏独、疆独、港独、东突/东突厥斯坦/ETIM/世维会、南蒙独立等宣传或象征。\n- 暴恐：恐怖组织标志、实施恐怖袭击、极端主义宣传。\n- 邪教：法轮功等。\n- 重大政治敏感历史的攻击性再现：六四、天安门事件相关暴力政治场景等。\n- 煽动颠覆政权、推翻共产党、颜色革命、分裂国家。\n- 用户用空格、符号、谐音、拆字、英文缩写等方式遮掩上述政治内容时，同样拒绝。\n\n【应当放行 — 娱乐与日常】（不要因“人红/名人”就拒）：\n- 娱乐明星、演员、歌手、偶像、主播、体育明星的普通写真、舞台、二创、卡通化、换装、壁纸（只要不涉及上述政治攻击）。\n- 普通恋爱、时尚、美食、风景、二次元、科幻、产品图、抽象艺术。\n- 仅提及名人姓名或娱乐八卦、粉丝向创作 → 允许。\n- 不要把“敏感人物”扩大到娱乐圈；政治人物 ≠ 娱乐明星。\n\n判定原则：\n- 核心看是否政治有害，而不是是否“有名气”。\n- 政治模糊且像攻击体制 → allowed=false。\n- 纯娱乐/商业/艺术、无政治攻击意图 → allowed=true。\n\n分辨率选择：\n- 1k：简单图标、emoji、小头像、草稿\n- 2k：绝大多数场景（默认）\n- 4k：海报、印刷、大场景、用户明确要求高清/4K\n\n画幅：1:1 头像；9:16/2:3/3:4/4:5 竖图；16:9/21:9/3:2/4:3 横图；5:4 传统照片。\n用户已明确比例或分辨率时优先尊重。\n",
+    "obvious_hint": true
+  },
+  "audit_strict": {
+    "description": "严格审核模式",
+    "type": "bool",
+    "hint": "开启后仅对高政治风险更严；不要用来打压娱乐明星内容。关键词预检始终拦截东突等政治词。",
+    "default": true
+  },
+  "request_timeout": {
+    "description": "生图请求超时（秒）",
+    "type": "int",
+    "hint": "adobe2api 生成可能较慢，建议 180~600",
+    "default": 300
+  },
+  "max_retries": {
+    "description": "上游繁忙时自动重试次数",
+    "type": "int",
+    "hint": "遇到 timeout / system under load / 5xx 时额外重试几次，默认 2（共最多 3 次请求）",
+    "default": 2,
+    "obvious_hint": true
+  },
+  "retry_backoff": {
+    "description": "重试间隔基数（秒）",
+    "type": "float",
+    "hint": "第 n 次重试等待 n × 该秒数，默认 3",
+    "default": 3
+  },
+  "llm_timeout": {
+    "description": "LLM 分析超时（秒）",
+    "type": "int",
+    "hint": "分辨率选择与审核共用",
+    "default": 45
+  },
+  "show_meta": {
+    "description": "结果附带分辨率等信息",
+    "type": "bool",
+    "hint": "开启后在生成完成时显示分辨率/比例；普通用户的剩余次数始终会在成功结果里提示",
+    "default": true
+  },
+  "permission_mode": {
+    "description": "指令使用权限",
+    "type": "string",
+    "hint": "all=所有人；admin=仅 AstrBot 管理员；whitelist=仅白名单（管理员始终可用）",
+    "default": "all",
+    "options": [
+      "all",
+      "admin",
+      "whitelist"
+    ],
+    "obvious_hint": true
+  },
+  "allowed_users": {
+    "description": "白名单用户 ID",
+    "type": "string",
+    "hint": "permission_mode=whitelist 时生效。多个 ID 用英文逗号或换行分隔",
+    "default": ""
+  },
+  "command_alias": {
+    "description": "额外指令别名",
+    "type": "string",
+    "hint": "逗号分隔，例如 draw,画图。默认已注册 /gpt图 /gptimage /gimg",
+    "default": ""
+  }
+}
