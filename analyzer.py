@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import unicodedata
@@ -185,6 +186,47 @@ def normalize_analyze_dict(
     )
 
 
+def _apply_audit_failure(
+    *,
+    prompt: str,
+    fallback: AnalyzeResult,
+    enable_audit: bool,
+    enable_keyword_filter: bool,
+    policy: str,
+) -> AnalyzeResult:
+    """Apply audit_failure_policy when LLM audit is unavailable or fails.
+
+    - block: return denied result (only when audit is enabled)
+    - keyword_only: run keyword check, allow if no keyword hit
+    - allow: always allow
+    """
+    if not enable_audit:
+        return fallback
+
+    policy = (policy or "keyword_only").strip().lower()
+    if policy not in ("block", "keyword_only", "allow"):
+        policy = "keyword_only"
+
+    if policy == "allow":
+        return fallback
+
+    if policy == "block":
+        return AnalyzeResult(
+            allowed=False,
+            reason="audit service unavailable",
+            resolution=fallback.resolution,
+            aspect_ratio=fallback.aspect_ratio,
+            source="block_on_failure",
+        )
+
+    # keyword_only
+    if enable_keyword_filter:
+        hit = keyword_audit(prompt)
+        if hit:
+            return hit
+    return fallback
+
+
 async def llm_analyze(
     context,
     *,
@@ -198,14 +240,20 @@ async def llm_analyze(
     system_prompt: str | None = None,
     enable_keyword_filter: bool = True,
     provider_id: str | None = None,
+    audit_failure_policy: str = "keyword_only",
 ) -> AnalyzeResult:
     """
-    使用当前对话模型：审核（可选）+ 选择 resolution/aspect_ratio。
+    Use the current conversation model: audit (optional) + select resolution/aspect_ratio.
 
-    重要：本函数绝不改写用户 prompt；生图文本由调用方原样传入 adobe2api。
+    Important: this function NEVER rewrites the user prompt; the text used for
+    image generation is passed through unchanged by the caller.
 
-    provider_id 非空时优先按 ID 取指定的 LLM 提供商（例如专门配置的快速审核模型），
-    获取失败则回退到当前会话正在使用的模型。
+    provider_id: if non-empty, prefer this LLM provider (e.g. a fast audit model).
+    audit_failure_policy: controls behavior when LLM is unavailable / errors /
+    returns unparseable output. One of:
+      - "block": reject the request (allowed=False) when audit is enabled
+      - "keyword_only": fall back to keyword filter only, allow if keywords pass
+      - "allow": allow everything (not recommended for public deployment)
     """
     # 关键词预检始终优先（政治硬拦），与 LLM 是否开启无关时仍建议开启
     if enable_audit and enable_keyword_filter:
@@ -251,9 +299,14 @@ async def llm_analyze(
             logger.warning(f"获取 LLM Provider 失败: {e}")
 
     if provider is None:
-        logger.warning("无可用 LLM Provider，使用启发式尺寸选择")
-        # 审核开启但无 LLM：关键词已过则放行选尺寸（关键词是政治硬拦）
-        return fallback
+        logger.warning("no LLM provider available, applying audit_failure_policy")
+        return _apply_audit_failure(
+            prompt=prompt,
+            fallback=fallback,
+            enable_audit=enable_audit,
+            enable_keyword_filter=enable_keyword_filter,
+            policy=audit_failure_policy,
+        )
 
     sys_prompt = (system_prompt or "").strip() or ANALYZE_SYSTEM_PROMPT
 
@@ -270,13 +323,16 @@ async def llm_analyze(
     )
 
     try:
-        resp = await provider.text_chat(
-            prompt=user_msg,
-            session_id=None,
-            image_urls=[],
-            func_tool=None,
-            contexts=[],
-            system_prompt=sys_prompt,
+        resp = await asyncio.wait_for(
+            provider.text_chat(
+                prompt=user_msg,
+                session_id=None,
+                image_urls=[],
+                func_tool=None,
+                contexts=[],
+                system_prompt=sys_prompt,
+            ),
+            timeout=max(1.0, float(timeout or 45.0)),
         )
         text = ""
         if resp is None:
@@ -290,38 +346,50 @@ async def llm_analyze(
 
         data = parse_llm_json(text)
         if not data:
-            logger.warning(f"LLM 返回无法解析为 JSON: {text[:200]}")
-            # LLM 失败时再跑一遍关键词；政治词已拦，其余放行选尺寸
-            if enable_audit and enable_keyword_filter:
-                hit = keyword_audit(prompt)
-                if hit:
-                    return hit
-            return fallback
+            logger.warning(f"LLM output unparseable as JSON: {text[:200]}")
+            return _apply_audit_failure(
+                prompt=prompt,
+                fallback=fallback,
+                enable_audit=enable_audit,
+                enable_keyword_filter=enable_keyword_filter,
+                policy=audit_failure_policy,
+            )
 
         result = normalize_analyze_dict(
             data,
             default_res=default_res,
             default_ratio=default_ratio,
-            # 严格模式只强化政治判断；normalize 里 risk 字段仍可触发
             strict=strict and enable_audit,
             audit_enabled=enable_audit,
         )
         if not enable_audit:
             result.allowed = True
             result.reason = ""
-        # 二次关键词兜底：防止 LLM 误放行政治词
         if enable_audit and enable_keyword_filter and result.allowed:
             hit = keyword_audit(prompt)
             if hit:
                 return hit
         return result
+    except asyncio.TimeoutError:
+        logger.warning(
+            f"LLM audit timed out after {timeout}s, applying audit_failure_policy"
+        )
+        return _apply_audit_failure(
+            prompt=prompt,
+            fallback=fallback,
+            enable_audit=enable_audit,
+            enable_keyword_filter=enable_keyword_filter,
+            policy=audit_failure_policy,
+        )
     except Exception as e:
-        logger.error(f"LLM 分析失败，回退启发式: {e}")
-        if enable_audit and enable_keyword_filter:
-            hit = keyword_audit(prompt)
-            if hit:
-                return hit
-        return fallback
+        logger.error(f"LLM analysis failed: {e}")
+        return _apply_audit_failure(
+            prompt=prompt,
+            fallback=fallback,
+            enable_audit=enable_audit,
+            enable_keyword_filter=enable_keyword_filter,
+            policy=audit_failure_policy,
+        )
 
 
 def parse_user_overrides(text: str) -> tuple[str, dict[str, Any]]:

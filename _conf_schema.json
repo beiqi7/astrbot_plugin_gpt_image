@@ -70,9 +70,16 @@
     "obvious_hint": true
   },
   "auto_select_size": {
-    "description": "用 LLM 自动选择分辨率与比例",
+    "description": "用 LLM 自动选择画幅比例（已更名为 auto_select_aspect_ratio，此处保留兼容）",
     "type": "bool",
-    "hint": "开启后会先调用当前对话模型分析 prompt，选出最合适的 1k/2k/4k 与画幅",
+    "hint": "开启后会调用 LLM 分析 prompt 选出最合适的画幅。分辨率由 resolution_mode 单独控制。",
+    "default": true,
+    "obvious_hint": true
+  },
+  "auto_select_aspect_ratio": {
+    "description": "用 LLM 自动选择画幅比例",
+    "type": "bool",
+    "hint": "开启后由 LLM 选画幅；关闭则使用 default_aspect_ratio。分辨率始终由 resolution_mode 决定。",
     "default": true,
     "obvious_hint": true
   },
@@ -110,6 +117,18 @@
     "type": "bool",
     "hint": "开启后仅对高政治风险更严；不要用来打压娱乐明星内容。关键词预检始终拦截东突等政治词。",
     "default": true
+  },
+  "audit_failure_policy": {
+    "description": "审核服务故障时的策略",
+    "type": "string",
+    "hint": "当 LLM 不可用/超时/返回异常时的行为：block=拒绝请求（公开部署推荐）；keyword_only=仅关键词拦截后放行（默认）；allow=全部放行（不推荐）",
+    "default": "keyword_only",
+    "options": [
+      "block",
+      "keyword_only",
+      "allow"
+    ],
+    "obvious_hint": true
   },
   "request_timeout": {
     "description": "生图请求超时（秒）",
@@ -165,5 +184,43 @@
     "type": "string",
     "hint": "逗号分隔，例如 draw,画图。默认已注册 /gpt图 /gptimage /gimg",
     "default": ""
+  },
+  "napcat_hosts": {
+    "description": "允许访问的 NapCat 本机地址",
+    "type": "string",
+    "hint": "逗号分隔的 host[:port] 白名单，用于下载 NapCat 本机反代图片。默认 127.0.0.1",
+    "default": "127.0.0.1",
+    "obvious_hint": true
+  },
+  "image_host_suffixes": {
+    "description": "允许的图床域名后缀",
+    "type": "string",
+    "hint": "逗号分隔的公网域名后缀白名单，例如 qpic.cn, qq.com。其他公网地址默认要求 HTTPS",
+    "default": "qpic.cn qq.com myqcloud.com gtimg.cn",
+    "obvious_hint": true
+  },
+  "allow_public_http": {
+    "description": "允许 HTTP（非 HTTPS）访问公网图片",
+    "type": "bool",
+    "hint": "默认关闭。开启后允许通过 HTTP 下载公网图片（不推荐）",
+    "default": false
+  },
+  "allowed_media_dirs": {
+    "description": "允许读取的本地媒体目录",
+    "type": "string",
+    "hint": "换行或分号分隔的额外目录白名单。默认已包含 AstrBot data/temp/cache 和系统临时目录",
+    "default": ""
+  },
+  "max_single_image_bytes": {
+    "description": "单张参考图最大字节数",
+    "type": "int",
+    "hint": "上传/下载单张参考图的上限，默认 15MB（15728640）",
+    "default": 15728640
+  },
+  "max_output_bytes": {
+    "description": "生成结果最大字节数",
+    "type": "int",
+    "hint": "adobe2api 返回的生成图片上限，默认 30MB（31457280）",
+    "default": 31457280
   }
 }

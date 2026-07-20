@@ -46,6 +46,37 @@ def parse_ratio_token(token: str) -> str | None:
     return None
 
 
+def nearest_ratio(width: int, height: int) -> str:
+    """
+    根据宽高像素值，从 GPT_IMAGE_RATIOS 里挑最接近的比例。
+    比较 log 空间下的差距，避免"横竖颠倒时误挑到反向比例"。
+    """
+    import math
+
+    try:
+        w = float(width)
+        h = float(height)
+    except Exception:
+        return "1:1"
+    if w <= 0 or h <= 0:
+        return "1:1"
+
+    target = math.log(w / h)
+    best = "1:1"
+    best_diff = float("inf")
+    for ratio in GPT_IMAGE_RATIOS.keys():
+        try:
+            a, b = ratio.split(":")
+            rv = float(a) / float(b)
+        except Exception:
+            continue
+        diff = abs(math.log(rv) - target)
+        if diff < best_diff:
+            best_diff = diff
+            best = ratio
+    return best
+
+
 def parse_resolution_token(token: str) -> str | None:
     raw = (token or "").strip().lower().replace("k", "k")
     raw = raw.replace(" ", "")
@@ -249,10 +280,11 @@ HELP_TEXT = """🎨 GPT Image 生图 / 改图
   /gpt图帮助
 
 可选参数：
-  --ratio 16:9     指定画幅（LLM 未选好时手动指定）
+  --ratio 16:9     指定画幅（覆盖自动选择）
   --no-auto        禁用 LLM 自动选画幅，用配置默认值
 
-分辨率由管理员在插件配置里选定（默认 2K）。
+分辨率策略由管理员配置：可固定为 1K/2K/4K，或由 LLM 自动选择；
+用户不能手动覆盖分辨率。
 
 示例：
   /gpt图 一只在樱花树下睡觉的橘猫

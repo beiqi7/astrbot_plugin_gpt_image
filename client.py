@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import re
 from pathlib import Path
 from typing import Any
@@ -12,6 +11,14 @@ from urllib.parse import urljoin, urlparse
 import aiohttp
 
 from astrbot.api import logger
+
+from .security import (
+    DEFAULT_MAX_OUTPUT_BYTES,
+    MAX_HTTP_CHUNK,
+    SecurityError,
+    safe_b64decode,
+    sniff_image_mime,
+)
 
 
 class Adobe2APIError(Exception):
@@ -147,8 +154,8 @@ class Adobe2APIClient:
                     raise
                 delay = self.retry_backoff * attempt
                 logger.warning(
-                    f"生图可重试失败 ({attempt}/{attempts})，{delay:.1f}s 后重试: "
-                    f"status={e.status} body={(e.body or '')[:200]}"
+                    f"retryable failure ({attempt}/{attempts}), "
+                    f"retry in {delay:.1f}s status={e.status}"
                 )
                 await asyncio.sleep(delay)
             except Exception:
@@ -313,10 +320,19 @@ class Adobe2APIClient:
             return data_url.split(",", 1)[1]
         return data_url
 
-    async def download_bytes(self, url: str, *, timeout: float = 60.0) -> bytes:
+    async def download_bytes(
+        self,
+        url: str,
+        *,
+        timeout: float = 60.0,
+        max_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+    ) -> bytes:
+        """Download bytes with streaming + size limit.
+
+        Raises SecurityError if the response exceeds max_bytes.
+        """
         session = await self._get_session()
         headers = {}
-        # 同源 generated 资源带上 api key 更稳妥
         try:
             host = urlparse(url).netloc
             base_host = urlparse(self.base_url).netloc
@@ -326,48 +342,87 @@ class Adobe2APIClient:
             pass
 
         req_timeout = aiohttp.ClientTimeout(total=max(5.0, float(timeout)), connect=15)
-        async with session.get(url, headers=headers, timeout=req_timeout) as resp:
+        async with session.get(
+            url, headers=headers, timeout=req_timeout, allow_redirects=True
+        ) as resp:
             if resp.status >= 400:
                 text = await resp.text()
                 raise Adobe2APIError(
-                    f"下载图片失败 HTTP {resp.status}: {text[:200]}",
+                    f"download failed HTTP {resp.status}: {text[:200]}",
                     status=resp.status,
                 )
-            return await resp.read()
+            declared = resp.headers.get("Content-Length", "")
+            if declared and declared.isdigit() and int(declared) > max_bytes:
+                raise Adobe2APIError(
+                    f"result image too large: {declared} > {max_bytes}",
+                    user_message="生成结果过大，请联系管理员检查。",
+                )
+            buf = bytearray()
+            async for chunk in resp.content.iter_chunked(MAX_HTTP_CHUNK):
+                buf.extend(chunk)
+                if len(buf) > max_bytes:
+                    raise Adobe2APIError(
+                        f"result image stream exceeded {max_bytes}B",
+                        user_message="生成结果过大，请联系管理员检查。",
+                    )
+            return bytes(buf)
 
     async def save_result_image(
         self,
         result: dict[str, Any],
         dest_dir: Path,
         filename_stem: str,
+        *,
+        max_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
     ) -> Path:
+        """Save the result image to dest_dir with size limit."""
         dest_dir.mkdir(parents=True, exist_ok=True)
         b64 = result.get("b64")
         url = result.get("url")
 
         if b64:
-            raw = base64.b64decode(b64)
+            try:
+                raw = safe_b64decode(str(b64), max_bytes=max_bytes)
+            except SecurityError as e:
+                raise Adobe2APIError(
+                    f"result b64 too large or invalid: {e}",
+                    user_message="生成结果过大，请联系管理员检查。",
+                ) from e
             path = dest_dir / f"{filename_stem}.png"
             path.write_bytes(raw)
             return path
 
         if url and str(url).startswith("data:image"):
-            raw_b64 = self._data_url_to_b64(str(url))
-            raw = base64.b64decode(raw_b64)
+            try:
+                raw_b64 = self._data_url_to_b64(str(url))
+                raw = safe_b64decode(raw_b64, max_bytes=max_bytes)
+            except SecurityError as e:
+                raise Adobe2APIError(
+                    f"result data URL too large: {e}",
+                    user_message="生成结果过大，请联系管理员检查。",
+                ) from e
             path = dest_dir / f"{filename_stem}.png"
             path.write_bytes(raw)
             return path
 
         if url:
-            content = await self.download_bytes(str(url))
+            content = await self.download_bytes(
+                str(url), max_bytes=max_bytes
+            )
             ext = ".png"
-            lower = str(url).lower()
-            if ".jpg" in lower or ".jpeg" in lower:
+            mime = sniff_image_mime(content)
+            if mime == "image/jpeg":
                 ext = ".jpg"
-            elif ".webp" in lower:
+            elif mime == "image/webp":
                 ext = ".webp"
+            else:
+                lower = str(url).lower()
+                if ".jpg" in lower or ".jpeg" in lower:
+                    ext = ".jpg"
+                elif ".webp" in lower:
+                    ext = ".webp"
             path = dest_dir / f"{filename_stem}{ext}"
             path.write_bytes(content)
             return path
 
-        raise Adobe2APIError("无可用图片数据可保存")
+        raise Adobe2APIError("no image data to save")

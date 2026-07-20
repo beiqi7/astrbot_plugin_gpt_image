@@ -9,6 +9,13 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
+try:
+    from astrbot.api import logger
+except Exception:
+    import logging
+
+    logger = logging.getLogger(__name__)
+
 
 # 东八区自然日（与国内使用场景一致）
 _TZ_CN = timezone(timedelta(hours=8))
@@ -61,9 +68,10 @@ class DailyQuota:
                 encoding="utf-8",
             )
             tmp.replace(self.path)
-        except Exception:
-            # 磁盘失败不阻断主流程，仅内存计数
-            pass
+        except Exception as e:
+            logger.warning(
+                f"[gpt_image] quota persist failed (in-memory only): {e}"
+            )
 
     def get_used(self, user_id: str) -> int:
         with self._lock:
@@ -91,7 +99,7 @@ class DailyQuota:
         return used < int(limit), used, int(limit)
 
     def consume(self, user_id: str, n: int = 1) -> int:
-        """成功生图后扣次，返回扣后已用次数。"""
+        """Increment usage by n. Returns new used count. (legacy: post-deduct)"""
         with self._lock:
             self._roll_if_needed()
             uid = str(user_id or "").strip() or "unknown"
@@ -100,6 +108,44 @@ class DailyQuota:
             except Exception:
                 cur = 0
             cur = max(0, cur) + max(1, int(n))
+            self._data["users"][uid] = cur
+            self._save()
+            return cur
+
+    def reserve(self, user_id: str, limit: int) -> tuple[bool, int]:
+        """Atomically check + pre-deduct 1 from the daily quota.
+
+        Returns (ok, new_used_count).
+        limit < 0 means unlimited (always ok, no deduction).
+        On upstream failure, caller should call refund().
+        """
+        if limit < 0:
+            return True, self.get_used(user_id)
+        with self._lock:
+            self._roll_if_needed()
+            uid = str(user_id or "").strip() or "unknown"
+            try:
+                cur = int(self._data["users"].get(uid, 0))
+            except Exception:
+                cur = 0
+            cur = max(0, cur)
+            if cur >= int(limit):
+                return False, cur
+            cur += 1
+            self._data["users"][uid] = cur
+            self._save()
+            return True, cur
+
+    def refund(self, user_id: str, n: int = 1) -> int:
+        """Refund n reservations (e.g. upstream generation failed)."""
+        with self._lock:
+            self._roll_if_needed()
+            uid = str(user_id or "").strip() or "unknown"
+            try:
+                cur = int(self._data["users"].get(uid, 0))
+            except Exception:
+                cur = 0
+            cur = max(0, cur - max(1, int(n)))
             self._data["users"][uid] = cur
             self._save()
             return cur

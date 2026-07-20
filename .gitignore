@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+astrbot_plugin_gpt_image.zip

@@ -40,7 +40,7 @@ AstrBot 生图插件：专门对接 [leik1000/adobe2api](https://github.com/leik
 ## 安装
 
 1. 将本目录放到 AstrBot 的 `data/plugins/` 下
-2. 依赖：`aiohttp`、`aiofiles`
+2. 依赖：`aiohttp>=3.9.0,<4.0.0`
 3. 确保已部署 adobe2api
 4. WebUI 填写 `base_url`、`api_key`，按需改 `daily_limit`
 
@@ -51,13 +51,20 @@ AstrBot 生图插件：专门对接 [leik1000/adobe2api](https://github.com/leik
 | `base_url` | adobe2api 地址 | `http://127.0.0.1:6001` |
 | `api_key` | API Key | 空 |
 | `daily_limit` | 普通用户每日成功生图次数 | `5` |
-| `default_resolution` | LLM 失败回退分辨率 | `2k` |
-| `default_aspect_ratio` | LLM 失败回退比例 | `1:1` |
-| `auto_select_size` | LLM 自动选尺寸 | `true` |
+| `resolution_mode` | `fixed`（固定）或 `llm`（LLM 自动选） | `fixed` |
+| `default_resolution` | 固定分辨率 / LLM 回退值 | `2k` |
+| `default_aspect_ratio` | 默认画幅比例 | `1:1` |
+| `auto_select_aspect_ratio` | LLM 自动选画幅 | `true` |
 | `enable_audit` | 输入审核 | `true` |
+| `audit_failure_policy` | 审核失败策略 `block`/`keyword_only`/`allow` | `keyword_only` |
 | `audit_provider_id` | 审核/选尺寸使用的独立 LLM ID | 空（用当前会话模型） |
 | `request_timeout` | 生图超时（秒） | `300` |
+| `llm_timeout` | LLM 审核超时（秒） | `45` |
 | `permission_mode` | `all` / `admin` / `whitelist` | `all` |
+| `napcat_hosts` | 允许的 NapCat 本机地址 | `127.0.0.1` |
+| `image_host_suffixes` | 允许的图床域名后缀 | `qpic.cn qq.com ...` |
+| `max_single_image_bytes` | 单张参考图上限（字节） | `15728640` |
+| `max_output_bytes` | 生成结果上限（字节） | `31457280` |
 
 额度文件位置：`data/plugin_data/astrbot_plugin_gpt_image/daily_quota.json`
 
@@ -85,18 +92,16 @@ AstrBot 生图插件：专门对接 [leik1000/adobe2api](https://github.com/leik
 ### 可选参数
 
 ```text
---ratio 16:9
---res 4k
---no-auto
---no-audit          # 仅管理员
---model firefly-gpt-image-2k-16x9
+--ratio 16:9       指定画幅（覆盖自动选择）
+--no-auto          禁用 LLM 自动选画幅，用配置默认值
+--no-audit         # 仅管理员
 ```
 
 ### 示例
 
 ```text
 /gpt图 一只在樱花树下睡觉的橘猫
-/gpt图 --ratio 9:16 --res 4k 竖版赛博朋克夜景
+/gpt图 --ratio 9:16 竖版赛博朋克夜景
 /gpt图次数
 ```
 
@@ -109,6 +114,7 @@ AstrBot 生图插件：专门对接 [leik1000/adobe2api](https://github.com/leik
 
 ## 版本
 
+- `v1.5.5` 安全加固：SSRF 防护、本地路径白名单、图片体积限制、额度原子预留、LLM 超时控制、审核失败策略、日志脱敏
 - `v1.5.0` 图生图取图加固（QQ 图床/data URL）；实测 adobe2api i2i 通过
 - `v1.4.x` 改图指令、政治审核收紧、娱乐放宽
 - `v1.3.0` 用户原文=prompt；LLM 仅审核+选模型

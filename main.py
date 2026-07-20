@@ -36,10 +36,20 @@ from .constants import (
     HELP_TEXT,
     RESOLUTIONS,
     build_model_id,
+    nearest_ratio,
     parse_ratio_token,
 )
-from .images import collect_reference_data_urls, count_image_like
+from .images import collect_reference_data_urls, count_image_like, probe_image_size
 from .quota import DailyQuota, today_key
+from .security import (
+    DEFAULT_MAX_OUTPUT_BYTES,
+    DEFAULT_MAX_SINGLE_IMAGE_BYTES,
+    PathPolicy,
+    UrlPolicy,
+    redact_path,
+    redact_prompt,
+    redact_url,
+)
 
 
 # 指令前缀：支持 /gpt图xxx（中文后无空格）—— AstrBot 标准 CommandFilter 要求 "cmd "
@@ -65,20 +75,54 @@ _CMD_HELP_RE = re.compile(
     "astrbot_plugin_gpt_image",
     "serenite",
     "adobe2api GPT Image 生图/改图：自动分辨率、内容审核、每日次数限制",
-    "1.5.4",
+    "1.5.5",
 )
 class GptImagePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         self.config = config or {}
         self.client = self._build_client()
-        self.data_dir = Path(__file__).parent / "output"
+        plugin_data = Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_gpt_image"
+        plugin_data.mkdir(parents=True, exist_ok=True)
+        self.data_dir = plugin_data / "output"
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        # 不设全局生图锁：多用户请求可并发打到 adobe2api（其内部自有排队/并发能力）
+        self.quota = DailyQuota(plugin_data / "daily_quota.json")
+        self._rebuild_policies()
 
-        quota_dir = Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_gpt_image"
-        quota_dir.mkdir(parents=True, exist_ok=True)
-        self.quota = DailyQuota(quota_dir / "daily_quota.json")
+    def _rebuild_policies(self) -> None:
+        """Build URL/path policies + size limits from config."""
+        napcat_hosts = str(
+            self._cfg("napcat_hosts", "127.0.0.1") or "127.0.0.1"
+        )
+        image_suffixes = str(
+            self._cfg(
+                "image_host_suffixes",
+                "qpic.cn qq.com myqcloud.com gtimg.cn",
+            )
+            or "qpic.cn qq.com myqcloud.com gtimg.cn"
+        )
+        self._url_policy = UrlPolicy.from_config(
+            napcat_hosts=napcat_hosts,
+            image_host_suffixes=image_suffixes,
+            allow_public_http=bool(self._cfg("allow_public_http", False)),
+        )
+        self._path_policy = PathPolicy.from_config(
+            allowed_media_dirs=str(self._cfg("allowed_media_dirs", "") or ""),
+        )
+        try:
+            self._max_single_image_bytes = int(
+                self._cfg("max_single_image_bytes", DEFAULT_MAX_SINGLE_IMAGE_BYTES)
+                or DEFAULT_MAX_SINGLE_IMAGE_BYTES
+            )
+        except Exception:
+            self._max_single_image_bytes = DEFAULT_MAX_SINGLE_IMAGE_BYTES
+        try:
+            self._max_output_bytes = int(
+                self._cfg("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)
+                or DEFAULT_MAX_OUTPUT_BYTES
+            )
+        except Exception:
+            self._max_output_bytes = DEFAULT_MAX_OUTPUT_BYTES
 
     # ------------------------------------------------------------------
     # config helpers
@@ -100,6 +144,7 @@ class GptImagePlugin(Star):
         )
 
     def _reload_client_if_needed(self) -> None:
+        self._rebuild_policies()
         new = self._build_client()
         old = self.client
         changed = (
@@ -361,9 +406,13 @@ class GptImagePlugin(Star):
         return max(1, min(n, 8))
 
     async def _collect_image_data_urls(self, event: AstrMessageEvent) -> list[str]:
-        """从当前消息与引用消息提取参考图，统一为 data URL。"""
+        """Extract reference images from current + quoted message as data URLs."""
         return await collect_reference_data_urls(
-            event, max_images=self._max_ref_images()
+            event,
+            max_images=self._max_ref_images(),
+            url_policy=self._url_policy,
+            path_policy=self._path_policy,
+            max_single_bytes=self._max_single_image_bytes,
         )
 
     async def _cleanup_old_files(self, minutes: int = 30) -> None:
@@ -386,12 +435,19 @@ class GptImagePlugin(Star):
         self,
         event: AstrMessageEvent,
         raw_text: str,
+        *,
+        ref_images: list[str] | None = None,
     ) -> tuple[Optional[AnalyzeResult], str, str, Optional[str]]:
         """
         流水线：
           用户原文 → prompt（生图用，永不改写）
           LLM/规则 → 仅审核 + 选 aspect_ratio；resolution 恒等于配置值
           → model_id
+
+        改图时（ref_images 非空）：
+          - 若用户没手动 --ratio，则用参考图的实际宽高比覆盖 LLM/默认比例，
+            保持原图画幅（避免出现 1:1 强行改成 16:9 的畸变）。
+          - 多张参考图时以第一张为准。
 
         返回 (analyze, user_prompt, model_id, error_message)
         """
@@ -402,15 +458,18 @@ class GptImagePlugin(Star):
 
         is_admin = self._is_admin(event)
         enable_audit = bool(self._cfg("enable_audit", True))
-        # --no-audit 仅管理员静默生效
         if overrides.get("no_audit") and is_admin:
             enable_audit = False
 
-        auto_select = bool(self._cfg("auto_select_size", True))
+        # auto_select_aspect_ratio: controls LLM-based aspect ratio selection only.
+        # Backward compat: read auto_select_aspect_ratio first, fall back to auto_select_size.
+        auto_aspect = bool(
+            self._cfg("auto_select_aspect_ratio", self._cfg("auto_select_size", True))
+        )
         if overrides.get("no_auto"):
-            auto_select = False
+            auto_aspect = False
 
-        # 分辨率决策：fixed=永远用 default_resolution；llm=交给 LLM，LLM 缺失时回退 default
+        # resolution_mode is the sole determinant of resolution source.
         res_mode = str(self._cfg("resolution_mode", "fixed") or "fixed").strip().lower()
         if res_mode not in ("fixed", "llm"):
             res_mode = "fixed"
@@ -421,8 +480,13 @@ class GptImagePlugin(Star):
         if default_ratio not in GPT_IMAGE_RATIOS:
             default_ratio = "1:1"
 
-        # 仅比例保留手动覆盖；--res / --model 忽略
         manual_ratio = parse_ratio_token(str(overrides.get("ratio") or ""))
+
+        audit_failure_policy = str(
+            self._cfg("audit_failure_policy", "keyword_only") or "keyword_only"
+        ).strip().lower()
+        if audit_failure_policy not in ("block", "keyword_only", "allow"):
+            audit_failure_policy = "keyword_only"
 
         audit_system_prompt = str(self._cfg("audit_prompt", "") or "").strip()
         audit_provider_id = str(self._cfg("audit_provider_id", "") or "").strip()
@@ -433,9 +497,17 @@ class GptImagePlugin(Star):
             system_prompt=audit_system_prompt or None,
             enable_keyword_filter=bool(self._cfg("enable_keyword_filter", True)),
             provider_id=audit_provider_id or None,
+            audit_failure_policy=audit_failure_policy,
         )
 
-        if auto_select and not manual_ratio:
+        # Determine if LLM is needed: for audit, for resolution, or for aspect ratio
+        need_llm = (
+            enable_audit
+            or (res_mode == "llm")
+            or (auto_aspect and not manual_ratio)
+        )
+
+        if need_llm:
             analyze = await llm_analyze(
                 self.context,
                 prompt=user_prompt,
@@ -445,31 +517,40 @@ class GptImagePlugin(Star):
                 **analyze_kwargs,
             )
         else:
-            if enable_audit:
-                analyze = await llm_analyze(
-                    self.context,
-                    prompt=user_prompt,
-                    default_res=default_res,
-                    default_ratio=manual_ratio or default_ratio,
-                    enable_audit=True,
-                    **analyze_kwargs,
-                )
-            else:
-                analyze = heuristic_size(
-                    user_prompt,
-                    default_res,
-                    manual_ratio or default_ratio,
-                )
-                analyze.source = "manual" if manual_ratio else "default"
+            analyze = heuristic_size(
+                user_prompt,
+                default_res,
+                manual_ratio or default_ratio,
+            )
+            analyze.source = "manual" if manual_ratio else "default"
 
         if not analyze.allowed:
             return analyze, user_prompt, "", None
 
-        # 用户 --ratio 优先覆盖 LLM 结果
+        # Aspect ratio post-processing
         if manual_ratio:
             analyze.aspect_ratio = manual_ratio
             if "manual" not in analyze.source:
                 analyze.source = f"{analyze.source}+manual"
+        elif not auto_aspect:
+            # auto_aspect off: use default ratio (LLM ratio ignored)
+            analyze.aspect_ratio = default_ratio
+        elif ref_images:
+            # 改图：默认按参考图原始比例。用第一张即可；多图时以主图为准。
+            ref_ratio = None
+            for ref in ref_images:
+                size = probe_image_size(ref)
+                if size:
+                    w, h = size
+                    ref_ratio = nearest_ratio(w, h)
+                    logger.info(
+                        f"[gpt_image] 参考图尺寸 {w}x{h} → 使用比例 {ref_ratio}"
+                    )
+                    break
+            if ref_ratio:
+                analyze.aspect_ratio = ref_ratio
+                if "ref" not in analyze.source:
+                    analyze.source = f"{analyze.source}+ref"
 
         if analyze.aspect_ratio not in GPT_IMAGE_RATIOS:
             analyze.aspect_ratio = default_ratio
@@ -546,13 +627,19 @@ class GptImagePlugin(Star):
             )
             return
 
-        # 次数检查放在分析之前
-        ok_q, deny_q = self._check_quota(event)
-        if not ok_q:
-            yield self._quoted_plain(event, deny_q)
-            return
+        # Atomic quota reservation (replaces check-then-consume)
+        limit = self._quota_limit_for(event)
+        reserved = False
+        if limit >= 0:
+            ok_q, _ = self.quota.reserve(self._user_id(event), limit)
+            if not ok_q:
+                yield self._quoted_plain(
+                    event, "今日次数已用完，请明天再试。"
+                )
+                return
+            reserved = True
 
-        # 进度提示用 send 直发；最终只 yield 一次，避免被 recall 类插件截断
+        # Progress notification via send (avoids recall plugins)
         await self._notify(
             event,
             f"⏳ 正在{'改图' if is_edit else '生图'}…（已取到参考图×{len(ref_images)}）"
@@ -560,27 +647,30 @@ class GptImagePlugin(Star):
             else "⏳ 正在生图…",
         )
 
-        analyze, prompt, model_id, err = await self._analyze_and_build(event, text)
+        analyze, prompt, model_id, err = await self._analyze_and_build(
+            event, text, ref_images=ref_images or None
+        )
         if err:
+            if reserved:
+                self.quota.refund(self._user_id(event))
             yield self._quoted_plain(event, err)
             return
         if analyze is not None and not analyze.allowed:
+            if reserved:
+                self.quota.refund(self._user_id(event))
             logger.info(
-                f"生图请求被拦截 user={self._user_id(event)} reason={analyze.reason}"
+                f"[gpt_image] request blocked user={self._user_id(event)} "
+                f"reason={analyze.reason}"
             )
             yield self._quoted_plain(event, "暂时无法处理该请求，请换一个描述再试。")
             return
         if not model_id or not prompt:
+            if reserved:
+                self.quota.refund(self._user_id(event))
             yield self._quoted_plain(event, "参数解析失败，请换一种描述再试。")
             return
 
-        ok_q2, deny_q2 = self._check_quota(event)
-        if not ok_q2:
-            yield self._quoted_plain(event, deny_q2)
-            return
-
         mode = "改图" if is_edit else "文生图"
-        limit = self._quota_limit_for(event)
 
         meta_bits = []
         if analyze:
@@ -589,33 +679,34 @@ class GptImagePlugin(Star):
         if ref_images:
             meta_bits.append(f"参考图×{len(ref_images)}")
         logger.info(
-            f"[gpt_image] 开始调用 adobe2api model={model_id} mode={mode} "
-            f"refs={len(ref_images)} prompt={prompt[:60]!r}"
+            f"[gpt_image] start adobe2api model={model_id} mode={mode} "
+            f"refs={len(ref_images)} {redact_prompt(prompt)}"
         )
         await self._notify(event, f"🎨 生成中…（{' · '.join(meta_bits)}）")
 
         try:
-            ok_q3, deny_q3 = self._check_quota(event)
-            if not ok_q3:
-                yield self._quoted_plain(event, deny_q3)
-                return
             result = await self.client.generate_image(
                 prompt=prompt,
                 model=model_id,
                 image_data_urls=ref_images or None,
                 timeout=float(self._cfg("request_timeout", 300) or 300),
             )
-            new_used = self.quota.consume(self._user_id(event), 1)
         except Adobe2APIError as e:
-            logger.error(f"GPT Image 生图失败: {e} body={(e.body or '')[:400]}")
+            if reserved:
+                self.quota.refund(self._user_id(event))
+            logger.error(f"[gpt_image] generate failed: {e}")
             yield self._quoted_plain(event, self._format_user_error(e))
             return
         except Exception as e:
-            logger.exception("GPT Image 未预期错误")
+            if reserved:
+                self.quota.refund(self._user_id(event))
+            logger.exception("[gpt_image] unexpected error")
             yield self._quoted_plain(event, self._format_user_error(e))
             return
 
-        logger.info(f"[gpt_image] adobe2api 返回成功 model={result.get('model')}")
+        logger.info(f"[gpt_image] adobe2api ok model={result.get('model')}")
+
+        new_used = self.quota.get_used(self._user_id(event))
 
         footer_parts: list[str] = []
         if bool(self._cfg("show_meta", True)) and analyze:
@@ -630,11 +721,12 @@ class GptImagePlugin(Star):
         await self._cleanup_old_files()
         stem = f"gpt_image_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
         try:
-            path = await self.client.save_result_image(result, self.data_dir, stem)
+            path = await self.client.save_result_image(
+                result, self.data_dir, stem, max_bytes=self._max_output_bytes
+            )
         except Exception as e:
-            logger.warning(f"保存图片失败，尝试直链发送: {e}")
+            logger.warning(f"[gpt_image] save failed, trying direct URL: {e}")
             if result.get("url"):
-                # 最终结果尽量 send 直发 + 再 yield 一次，提高送达率
                 chain = []
                 if footer:
                     chain.append(Plain(f"✅ 生成完成\n{footer}\n"))
@@ -656,9 +748,9 @@ class GptImagePlugin(Star):
         quoted = self._with_user_quote(event, chain)
         try:
             await event.send(MessageChain(chain=quoted))
-            logger.info(f"[gpt_image] 结果已 send 直发 path={path}")
+            logger.info(f"[gpt_image] result sent path={redact_path(path)}")
         except Exception as e:
-            logger.warning(f"send 直发失败，回退 yield: {e}")
+            logger.warning(f"[gpt_image] send failed, fallback yield: {e}")
             yield event.chain_result(quoted)
             return
         # 已 send，再给一个空/轻量结果避免框架报未返回
@@ -680,15 +772,21 @@ class GptImagePlugin(Star):
         r"gpt图帮助|gptimagehelp|gimghelp)"
     )
     async def cmd_gpt_entry(self, event: AstrMessageEvent):
-        """统一入口：兼容「gpt图」后无空格，并拦截主 Agent 抢消息。"""
+        """Unified entry: handles all gpt图* commands via regex.
+
+        Only this regex entry is registered (no @filter.command duplicates)
+        to prevent double-execution where regex + command both fire.
+        """
         text = self._raw_message_text(event)
-        logger.info(f"[gpt_image] 命中入口 message={text[:80]!r} images={count_image_like(event)}")
+        logger.info(
+            f"[gpt_image] entry matched images={count_image_like(event)} "
+            f"text={redact_prompt(text)}"
+        )
 
         if not self._should_handle_as_command(event):
-            logger.info("[gpt_image] 未 @/唤醒 且非显式指令，忽略")
+            logger.info("[gpt_image] not @/wake and not explicit command, skip")
             return
 
-        # 帮助 / 次数（先匹配完整短指令）
         if _CMD_HELP_RE.match(text):
             self._stop_other_handlers(event)
             yield self._quoted_plain(event, HELP_TEXT)
@@ -702,11 +800,10 @@ class GptImagePlugin(Star):
             yield self._quoted_plain(event, self._quota_status_text(event))
             return
 
-        # 改图（长指令优先，避免被 gpt图 吃掉）
         if _CMD_EDIT_RE.search(text):
             self._stop_other_handlers(event)
             prompt = self._extract_prompt_text(event, edit=True)
-            logger.info(f"[gpt_image] 改图 prompt={prompt[:80]!r}")
+            logger.info(f"[gpt_image] edit {redact_prompt(prompt)}")
             async for result in self._run_generate(
                 event, prompt, require_image=True, force_edit=True
             ):
@@ -716,44 +813,10 @@ class GptImagePlugin(Star):
         if _CMD_GEN_RE.search(text):
             self._stop_other_handlers(event)
             prompt = self._extract_prompt_text(event, edit=False)
-            logger.info(f"[gpt_image] 生图/图生图 prompt={prompt[:80]!r}")
+            logger.info(f"[gpt_image] gen {redact_prompt(prompt)}")
             async for result in self._run_generate(event, prompt):
                 yield result
             return
-
-    # 保留 command 注册：有空格的规范写法仍可用，并在插件列表里显示
-    @filter.command("gpt图", alias={"gptimage", "gimg", "gptimg"})
-    async def cmd_gpt_image(self, event: AstrMessageEvent):
-        """GPT Image 文生图；消息里带图时自动图生图/改图"""
-        self._stop_other_handlers(event)
-        text = self._extract_prompt_text(event, edit=False)
-        async for result in self._run_generate(event, text):
-            yield result
-
-    @filter.command("gpt改图", alias={"gpt编辑", "gptedit", "gedit", "改图"})
-    async def cmd_gpt_edit(self, event: AstrMessageEvent):
-        """GPT Image 改图：必须附图或回复图片，说明如何修改"""
-        self._stop_other_handlers(event)
-        text = self._extract_prompt_text(event, edit=True)
-        async for result in self._run_generate(
-            event, text, require_image=True, force_edit=True
-        ):
-            yield result
-
-    @filter.command("gpt图次数", alias={"gptimagequota", "gimgquota", "gpt额度"})
-    async def cmd_quota(self, event: AstrMessageEvent):
-        """查看今日 GPT Image 生图剩余次数"""
-        self._stop_other_handlers(event)
-        ok, deny = self._check_permission(event)
-        if not ok:
-            yield self._quoted_plain(event, deny)
-            return
-        yield self._quoted_plain(event, self._quota_status_text(event))
-
-    @filter.command("gpt图帮助", alias={"gptimagehelp", "gimghelp"})
-    async def cmd_help(self, event: AstrMessageEvent):
-        self._stop_other_handlers(event)
-        yield self._quoted_plain(event, HELP_TEXT)
 
     @filter.llm_tool(name="gpt_image_generate")
     async def tool_gpt_image(
