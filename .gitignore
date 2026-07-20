@@ -1,6 +1,33 @@
-output/
+# Python bytecode
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+
+# Distribution / packaging
+*.zip
+*.egg-info/
+*.egg
+build/
+dist/
+
+# Runtime data
+output/
+data/
+
+# OS files
 .DS_Store
-astrbot_plugin_gpt_image.zip
+Thumbs.db
+desktop.ini
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Env / secrets
+.env
+.env.local
+*.key
