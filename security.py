@@ -555,14 +555,14 @@ class PathPolicy:
                     f"[gpt_image] path policy: ignoring forbidden root {s}"
                 )
                 continue
-            try:
-                if rp == rp.anchor and rp.anchor:
-                    logger.warning(
-                        f"[gpt_image] path policy: ignoring drive root {s}"
-                    )
-                    continue
-            except Exception:
-                pass
+            # On Windows, rp.anchor is the drive root (e.g. "C:\\").
+            # Path("C:\\") == "C:\\" is False (Path vs str), so compare
+            # str(rp) to rp.anchor to detect drive roots correctly.
+            if rp.anchor and str(rp) == rp.anchor:
+                logger.warning(
+                    f"[gpt_image] path policy: ignoring drive root {s}"
+                )
+                continue
             try:
                 home = Path.home().resolve(strict=False)
                 if rp == home:

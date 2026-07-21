@@ -192,13 +192,6 @@ def normalize_analyze_dict(
     if not allowed and not reason:
         reason = "内容未通过安全审核"
 
-    # 仅当模型显式标出高政治风险时才加拒；不因 medium/娱乐向 uncertain 误杀
-    if strict:
-        flag = str(data.get("risk") or data.get("risk_level") or "").lower()
-        if flag in {"high", "political", "ban", "block"}:
-            allowed = False
-            reason = reason or "判定存在政治合规风险"
-
     return AnalyzeResult(
         allowed=allowed,
         reason=reason,
@@ -221,11 +214,21 @@ def _apply_audit_failure(
     - block: return denied result (only when audit is enabled)
     - keyword_only: run keyword check, allow if no keyword hit
     - allow: always allow
+
+    Keyword filter is ALWAYS run (when enabled) regardless of
+    enable_audit, so political hard-blocks survive even when the
+    LLM audit layer is turned off.
     """
+    # Keyword filter runs unconditionally (independent of enable_audit)
+    if enable_keyword_filter:
+        hit = keyword_audit(prompt)
+        if hit:
+            return hit
+
     if not enable_audit:
         return fallback
 
-    policy = (policy or "keyword_only").strip().lower()
+    policy = (policy or "block").strip().lower()
     if policy not in ("block", "keyword_only", "allow"):
         policy = "keyword_only"
 
@@ -241,11 +244,8 @@ def _apply_audit_failure(
             source="block_on_failure",
         )
 
-    # keyword_only
-    if enable_keyword_filter:
-        hit = keyword_audit(prompt)
-        if hit:
-            return hit
+    # keyword_only: keyword already checked at the top of this function,
+    # just allow if we got here.
     return fallback
 
 
@@ -282,8 +282,9 @@ async def llm_analyze(
       - "keyword_only": fall back to keyword filter only, allow if keywords pass
       - "allow": allow everything (not recommended for public deployment)
     """
-    # 关键词预检始终优先（政治硬拦），与 LLM 是否开启无关时仍建议开启
-    if enable_audit and enable_keyword_filter:
+    # 关键词预检无条件执行（只要 enable_keyword_filter=True），独立于
+    # enable_audit。政治硬拦截不应因审核关闭而失效。
+    if enable_keyword_filter:
         hit = keyword_audit(prompt)
         if hit:
             return hit
@@ -406,7 +407,7 @@ async def llm_analyze(
         if not enable_audit:
             result.allowed = True
             result.reason = ""
-        if enable_audit and enable_keyword_filter and result.allowed:
+        if enable_keyword_filter and result.allowed:
             hit = keyword_audit(prompt)
             if hit:
                 return hit
@@ -444,7 +445,7 @@ def parse_user_overrides(text: str) -> tuple[str, dict[str, Any]]:
     remaining = text or ""
 
     patterns = [
-        (r"(?:--ratio|--aspect|-r)\s+([^\s]+)", "ratio"),
+        (r"(?:--ratio|--aspect)\s+([^\s]+)", "ratio"),
         (r"(?:比例[:：])\s*([^\s]+)", "ratio"),
     ]
 
@@ -464,5 +465,7 @@ def parse_user_overrides(text: str) -> tuple[str, dict[str, Any]]:
         overrides["no_auto"] = True
         remaining = re.sub(r"(?:--no-auto)\b", " ", remaining, flags=re.IGNORECASE)
 
-    remaining = re.sub(r"\s+", " ", remaining).strip()
-    return remaining, overrides
+    # Only strip leading/trailing whitespace; preserve internal spacing
+    # (newlines, tabs, multiple spaces) so the prompt is passed to the
+    # image model as close to the user's original text as possible.
+    return remaining.strip(), overrides

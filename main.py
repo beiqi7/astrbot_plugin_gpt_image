@@ -60,7 +60,7 @@ _CMD_GEN_RE = re.compile(
     re.IGNORECASE,
 )
 _CMD_EDIT_RE = re.compile(
-    r"^[/!！.．]?(?:gpt改图|gpt编辑|gptedit|gedit|改图)(?=$|[\s,，:：]|[\u4e00-\u9fff])",
+    r"^[/!！.．]?(?:gpt改图|gpt编辑|gptedit|gpt_edit|gedit|改图)(?=$|[\s,，:：]|[\u4e00-\u9fff])",
     re.IGNORECASE,
 )
 _CMD_QUOTA_RE = re.compile(
@@ -77,7 +77,7 @@ _CMD_HELP_RE = re.compile(
     "astrbot_plugin_gpt_image",
     "serenite",
     "adobe2api GPT Image 生图/改图：自动分辨率、内容审核、每日次数限制",
-    "1.5.5",
+    "1.6.0",
 )
 class GptImagePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
@@ -88,7 +88,9 @@ class GptImagePlugin(Star):
         self._max_single_image_bytes = DEFAULT_MAX_SINGLE_IMAGE_BYTES
         self._max_output_bytes = DEFAULT_MAX_OUTPUT_BYTES
         self._rebuild_policies()
-        self.client = self._build_client()
+        # Client is built lazily in initialize() to avoid double construction
+        # (initialize -> _reload_client_if_needed would create a second one).
+        self.client = None  # type: ignore[assignment]
         plugin_data = Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_gpt_image"
         plugin_data.mkdir(parents=True, exist_ok=True)
         self.data_dir = plugin_data / "output"
@@ -96,17 +98,19 @@ class GptImagePlugin(Star):
         self.quota = DailyQuota(plugin_data / "daily_quota.json")
         self._bg_tasks: set[asyncio.Task] = set()
 
-        # Concurrency control (semaphores are created lazily so they bind
-        # to the running event loop).
+        # Concurrency control. We maintain our own counters instead of
+        # peeking at asyncio.Semaphore private attributes (_value etc.),
+        # which are CPython implementation details and may break across
+        # versions.
         self._global_sem: Optional[asyncio.Semaphore] = None
         self._user_sems: dict[str, asyncio.Semaphore] = {}
         self._group_sems: dict[str, asyncio.Semaphore] = {}
-        # Admission semaphore caps the total in-flight tasks (running +
-        # waiting) at max_concurrent_global + max_queue_length. Acquired
-        # synchronously (no await) before any work starts, so the queue
-        # limit cannot be bypassed by tasks that get stuck on per-user
-        # or per-group semaphores later.
+        # Admission: BoundedSemaphore caps total in-flight tasks.
         self._admission_sem: Optional[asyncio.BoundedSemaphore] = None
+        # Running counts for reaping idle user/group semaphores.
+        self._user_active: dict[str, int] = {}
+        self._group_active: dict[str, int] = {}
+        self._admission_count = 0
         self._queued_lock: Optional[asyncio.Lock] = None
 
     def _rebuild_policies(self) -> None:
@@ -179,8 +183,10 @@ class GptImagePlugin(Star):
             image_host_suffixes="",
             allow_public_http=allow_api_http,
         )
-        # Output image policy: same as api policy (output URLs are
-        # served by adobe2api itself).
+        # Output image policy: allows base_url's exact host:port AND any
+        # public HTTPS host (adobe2api may return output URLs on arbitrary
+        # CDNs). API key auth headers are only sent to same-origin (see
+        # client._download_headers), so this does not leak credentials.
         self._output_url_policy = UrlPolicy.from_config(
             napcat_hosts=base_host_port,
             image_host_suffixes=image_suffixes,
@@ -247,6 +253,16 @@ class GptImagePlugin(Star):
         self._rebuild_policies()
         new = self._build_client()
         old = self.client
+        # First call after __init__ (client is None): just install new.
+        if old is None:
+            new.set_url_policy(self._api_url_policy)
+            new.set_output_url_policy(self._output_url_policy)
+            new.set_max_output_bytes(self._max_output_bytes)
+            new.set_allow_insecure_http(
+                bool(self._cfg("allow_insecure_api_http", False))
+            )
+            self.client = new
+            return
         changed = (
             new.base_url != old.base_url
             or new.api_key != old.api_key
@@ -296,7 +312,8 @@ class GptImagePlugin(Star):
             task.cancel()
         await asyncio.gather(*self._bg_tasks, return_exceptions=True)
         self._bg_tasks.clear()
-        await self.client.close()
+        if self.client is not None:
+            await self.client.close()
 
     # ------------------------------------------------------------------
     # permission / admin / quota
@@ -644,10 +661,6 @@ class GptImagePlugin(Star):
     def _ensure_concurrency(self) -> None:
         if self._global_sem is None:
             self._global_sem = asyncio.Semaphore(self._global_capacity())
-        if self._admission_sem is None:
-            self._admission_sem = asyncio.BoundedSemaphore(
-                self._admission_capacity()
-            )
         if self._queued_lock is None:
             self._queued_lock = asyncio.Lock()
 
@@ -655,10 +668,6 @@ class GptImagePlugin(Star):
         sem = self._user_sems.get(uid)
         if sem is None:
             sem = asyncio.Semaphore(self._user_capacity())
-            # Stash initial capacity so _sem_is_idle can detect idle
-            # semaphores across Python versions (3.10 added _bound_value,
-            # earlier versions only expose the current _value).
-            setattr(sem, "_gpt_capacity", self._user_capacity())
             self._user_sems[uid] = sem
         return sem
 
@@ -666,82 +675,94 @@ class GptImagePlugin(Star):
         sem = self._group_sems.get(gid)
         if sem is None:
             sem = asyncio.Semaphore(self._group_capacity())
-            setattr(sem, "_gpt_capacity", self._group_capacity())
             self._group_sems[gid] = sem
         return sem
 
-    @staticmethod
-    def _sem_is_idle(sem: asyncio.Semaphore) -> bool:
-        """True iff the semaphore is at full capacity and has no waiters.
+    def _inc_user(self, uid: str) -> None:
+        self._user_active[uid] = self._user_active.get(uid, 0) + 1
 
-        Used to reap per-user / per-group semaphores so a public bot
-        processing many distinct accounts / groups doesn't leak memory.
+    def _inc_group(self, gid: str) -> None:
+        self._group_active[gid] = self._group_active.get(gid, 0) + 1
+
+    def _dec_user(self, uid: str) -> None:
+        v = self._user_active.get(uid, 0) - 1
+        if v <= 0:
+            self._user_active.pop(uid, None)
+        else:
+            self._user_active[uid] = v
+        self._maybe_reap_sems()
+
+    def _dec_group(self, gid: str) -> None:
+        v = self._group_active.get(gid, 0) - 1
+        if v <= 0:
+            self._group_active.pop(gid, None)
+        else:
+            self._group_active[gid] = v
+        self._maybe_reap_sems()
+
+    _SEMS_REAP_THRESHOLD = 200
+
+    def _maybe_reap_sems(self) -> None:
+        """Lazy cleanup of idle user/group semaphore entries.
+
+        Only runs when the dicts grow past a threshold; removes entries
+        whose active count is 0 (no one holding or waiting).
         """
-        try:
-            value = getattr(sem, "_value", 0)
-            capacity = (
-                getattr(sem, "_gpt_capacity", None)
-                or getattr(sem, "_bound_value", None)
-                or value
-            )
-            if value < capacity:
-                return False
-            waiters = getattr(sem, "_waiters", None)
-            if waiters and len(waiters) > 0:
-                return False
-            return True
-        except Exception:
-            return False
-
-    def _release_user_sem(self, uid: str, sem: asyncio.Semaphore) -> None:
-        if uid in self._user_sems and self._sem_is_idle(sem):
-            self._user_sems.pop(uid, None)
-
-    def _release_group_sem(self, gid: str, sem: asyncio.Semaphore) -> None:
-        if gid in self._group_sems and self._sem_is_idle(sem):
-            self._group_sems.pop(gid, None)
+        if len(self._user_sems) > self._SEMS_REAP_THRESHOLD:
+            idle = [uid for uid in self._user_sems if uid not in self._user_active]
+            for uid in idle:
+                self._user_sems.pop(uid, None)
+        if len(self._group_sems) > self._SEMS_REAP_THRESHOLD:
+            idle = [gid for gid in self._group_sems if gid not in self._group_active]
+            for gid in idle:
+                self._group_sems.pop(gid, None)
 
     async def _try_admit(self) -> bool:
         """Try to acquire an admission slot without waiting.
 
-        Returns True iff a slot was acquired. The caller MUST release it
-        via `_release_admission()` on every exit path (success, failure,
-        cancellation).
-
-        This is the single gate that enforces `max_concurrent_global +
-        max_queue_length`. It closes the bypass where a task that would
-        block on a per-user / per-group semaphore was incorrectly
-        classified as "not waiting" and let in without consuming a slot.
+        Uses a simple counter instead of peeking at Semaphore internals.
+        Safe because asyncio is single-threaded: no other coroutine can
+        run between the check and the increment (no await in between).
         """
         self._ensure_concurrency()
-        sem = self._admission_sem  # type: ignore[union-attr]
-        # asyncio is single-threaded: no other coroutine can run between
-        # this check and the acquire() call (no await in between), so
-        # the check-then-acquire is atomic. If _value > 0, acquire()
-        # won't suspend and will just decrement _value synchronously.
-        if getattr(sem, "_value", 0) <= 0:
+        capacity = self._admission_capacity()
+        if self._admission_count >= capacity:
             return False
-        await sem.acquire()
+        self._admission_count += 1
         return True
 
     def _release_admission(self) -> None:
-        if self._admission_sem is not None:
-            try:
-                self._admission_sem.release()
-            except ValueError:
-                # Already at bound; ignore (defensive).
-                pass
+        self._admission_count = max(0, self._admission_count - 1)
 
     def _on_bg_task_done(self, task: asyncio.Task) -> None:
-        """Retrieve task exception so it isn't dropped silently.
+        """Cleanup callback for background generation tasks.
 
-        `_generate_and_deliver` already catches its own errors and
-        refunds the quota in `finally`; this callback exists solely so
-        Python doesn't log 'Task exception was never retrieved' when the
-        finally block itself (or an unexpected place) raises.
+        - If the task was cancelled before its coroutine body started
+          (finally never ran), refund quota + release admission here.
+        - Retrieve and log any unhandled exception so Python doesn't
+          warn 'Task exception was never retrieved'.
         """
         self._bg_tasks.discard(task)
         if task.cancelled():
+            # If the coroutine body already ran its finally block, it
+            # set _gpt_cleaned = True and we must NOT do a second
+            # refund + admission release (would double-count).
+            if getattr(task, "_gpt_cleaned", False):
+                return
+            # The coroutine body never started (or finally didn't run).
+            # Do the cleanup here using metadata stashed on the task.
+            uid = getattr(task, "_gpt_uid", None)
+            reserved = getattr(task, "_gpt_reserved", False)
+            res_date = getattr(task, "_gpt_res_date", "")
+            if uid and reserved:
+                try:
+                    self.quota.refund(uid, reservation_date=res_date)
+                    logger.info(
+                        f"[gpt_image] refunded quota for cancelled task user={uid}"
+                    )
+                except Exception as e:
+                    logger.warning(f"[gpt_image] refund for cancelled task failed: {e}")
+            self._release_admission()
             return
         try:
             exc = task.exception()
@@ -927,7 +948,7 @@ class GptImagePlugin(Star):
             yield self._quoted_plain(event, deny)
             return
 
-        if not client.configured():
+        if client is None or not client.configured():
             yield self._quoted_plain(
                 event,
                 "⚠️ 未配置 adobe2api 地址。请在插件配置中填写 base_url 与 api_key。",
@@ -948,34 +969,8 @@ class GptImagePlugin(Star):
             )
             return
 
-        # 先收参考图（改图指令必须有图）
-        image_like_n = count_image_like(event)
-        ref_images = await self._collect_image_data_urls(event)
-        is_edit = bool(force_edit or require_image or ref_images)
-        if (force_edit or require_image) and not ref_images:
-            if image_like_n > 0:
-                yield self._quoted_plain(
-                    event,
-                    "检测到图片但读取失败。请重新发送原图（不要用表情包缩略图），"
-                    "或换一张后重试；回复带图消息时请确认引用的是图片。",
-                )
-            else:
-                yield self._quoted_plain(
-                    event,
-                    "改图需要参考图。请发送图片并配上修改说明，或回复一张图片后使用改图指令。\n"
-                    "示例：发图 + /gpt改图 改成水彩风格",
-                )
-            return
-        if image_like_n > 0 and not ref_images:
-            # 用户附图了但提取失败：不要默默改走文生图
-            yield self._quoted_plain(
-                event,
-                "消息里好像有图，但没能读到参考图，已取消（避免变成纯文生图）。\n"
-                "请重新发送原图后再试 /gpt改图 或 /gpt图。",
-            )
-            return
-
-        # Atomic quota reservation (replaces check-then-consume)
+        # Atomic quota reservation (BEFORE image download so that users
+        # without quota can't trigger expensive remote downloads).
         limit = self._quota_limit_for(event)
         reserved = False
         res_date = ""
@@ -988,10 +983,8 @@ class GptImagePlugin(Star):
                 return
             reserved = True
 
-        # Admission slot caps total in-flight tasks at
-        # max_concurrent_global + max_queue_length. Acquired non-blockingly
-        # here so a full budget is rejected immediately (with refund)
-        # rather than silently queued.
+        # Admission slot (BEFORE image download so the queue limit
+        # protects the download phase too).
         admitted = await self._try_admit()
         if not admitted:
             if reserved:
@@ -1002,90 +995,123 @@ class GptImagePlugin(Star):
             )
             return
 
-        # Progress notification via send (avoids recall plugins)
-        await self._notify(
-            event,
-            f"⏳ 正在{'改图' if is_edit else '生图'}…（已取到参考图×{len(ref_images)}）"
-            if ref_images
-            else "⏳ 正在生图…",
-        )
-
-        analyze = None
-        prompt = ""
-        model_id = ""
-        err = ""
+        # --- From here we hold quota + admission. The finally block
+        # below cleans up on every exit where the background task has
+        # NOT taken ownership (transferred == False). Covers cancel
+        # during _notify, image download, analyze, etc. ---
+        transferred = False
         try:
-            analyze, prompt, model_id, err = await self._analyze_and_build(
-                event, text, ref_images=ref_images or None
-            )
-        except asyncio.CancelledError:
-            if reserved:
-                self.quota.refund(self._user_id(event), reservation_date=res_date)
-            self._release_admission()
-            logger.warning("[gpt_image] analyze cancelled")
-            raise
-        except Exception:
-            if reserved:
-                self.quota.refund(self._user_id(event), reservation_date=res_date)
-            self._release_admission()
-            logger.exception("[gpt_image] analyze failed")
-            yield self._quoted_plain(event, "❌ 分析失败，请稍后再试。")
-            return
+            # Download reference images (gated by quota + admission)
+            image_like_n = count_image_like(event)
+            ref_images = await self._collect_image_data_urls(event)
+            is_edit = bool(force_edit or require_image or ref_images)
+            if (force_edit or require_image) and not ref_images:
+                if image_like_n > 0:
+                    yield self._quoted_plain(
+                        event,
+                        "检测到图片但读取失败。请重新发送原图（不要用表情包缩略图），"
+                        "或换一张后重试；回复带图消息时请确认引用的是图片。",
+                    )
+                else:
+                    yield self._quoted_plain(
+                        event,
+                        "改图需要参考图。请发送图片并配上修改说明，或回复一张图片后使用改图指令。\n"
+                        "示例：发图 + /gpt改图 改成水彩风格",
+                    )
+                return
+            if image_like_n > 0 and not ref_images:
+                yield self._quoted_plain(
+                    event,
+                    "消息里好像有图，但没能读到参考图，已取消（避免变成纯文生图）。\n"
+                    "请重新发送原图后再试 /gpt改图 或 /gpt图。",
+                )
+                return
 
-        if err:
-            if reserved:
-                self.quota.refund(self._user_id(event), reservation_date=res_date)
-            self._release_admission()
-            yield self._quoted_plain(event, err)
-            return
-        if analyze is not None and not analyze.allowed:
-            if reserved:
-                self.quota.refund(self._user_id(event), reservation_date=res_date)
-            self._release_admission()
+            # Progress notification via send (avoids recall plugins)
+            await self._notify(
+                event,
+                f"⏳ 正在{'改图' if is_edit else '生图'}…（已取到参考图×{len(ref_images)}）"
+                if ref_images
+                else "⏳ 正在生图…",
+            )
+
+            analyze = None
+            prompt = ""
+            model_id = ""
+            err = ""
+            try:
+                analyze, prompt, model_id, err = await self._analyze_and_build(
+                    event, text, ref_images=ref_images or None
+                )
+            except asyncio.CancelledError:
+                logger.warning("[gpt_image] analyze cancelled")
+                raise
+            except Exception:
+                logger.exception("[gpt_image] analyze failed")
+                yield self._quoted_plain(event, "❌ 分析失败，请稍后再试。")
+                return
+
+            if err:
+                yield self._quoted_plain(event, err)
+                return
+            if analyze is not None and not analyze.allowed:
+                logger.info(
+                    f"[gpt_image] request blocked user={self._user_id(event)} "
+                    f"reason={analyze.reason}"
+                )
+                yield self._quoted_plain(event, "暂时无法处理该请求，请换一个描述再试。")
+                return
+            if not model_id or not prompt:
+                yield self._quoted_plain(event, "参数解析失败，请换一种描述再试。")
+                return
+
+            mode = "改图" if is_edit else "文生图"
+
+            meta_bits = []
+            if analyze:
+                meta_bits.append(f"{analyze.resolution.upper()} · {analyze.aspect_ratio}")
+            meta_bits.append(mode)
+            if ref_images:
+                meta_bits.append(f"参考图×{len(ref_images)}")
             logger.info(
-                f"[gpt_image] request blocked user={self._user_id(event)} "
-                f"reason={analyze.reason}"
+                f"[gpt_image] start adobe2api model={model_id} mode={mode} "
+                f"refs={len(ref_images)} {redact_prompt(prompt)}"
             )
-            yield self._quoted_plain(event, "暂时无法处理该请求，请换一个描述再试。")
+            await self._notify(event, f"🎨 生成中…（{' · '.join(meta_bits)}）")
+
+            # Launch background generation to avoid tool timeout (120s)
+            # and keep handler responsive
+            task = asyncio.create_task(self._generate_and_deliver(
+                event=event,
+                client=client,
+                prompt=prompt,
+                model_id=model_id,
+                ref_images=ref_images,
+                reserved=reserved,
+                res_date=res_date,
+                limit=limit,
+                analyze=analyze,
+                mode=mode,
+            ))
+            # Stash cleanup metadata on the task so _on_bg_task_done can
+            # do refund + admission release if the task is cancelled
+            # before its coroutine body even starts (finally won't run).
+            task._gpt_uid = self._user_id(event)  # type: ignore[attr-defined]
+            task._gpt_reserved = reserved  # type: ignore[attr-defined]
+            task._gpt_res_date = res_date  # type: ignore[attr-defined]
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._on_bg_task_done)
+            # Ownership transferred: the background task is now
+            # responsible for refunding quota and releasing admission.
+            transferred = True
             return
-        if not model_id or not prompt:
-            if reserved:
-                self.quota.refund(self._user_id(event), reservation_date=res_date)
-            self._release_admission()
-            yield self._quoted_plain(event, "参数解析失败，请换一种描述再试。")
-            return
-
-        mode = "改图" if is_edit else "文生图"
-
-        meta_bits = []
-        if analyze:
-            meta_bits.append(f"{analyze.resolution.upper()} · {analyze.aspect_ratio}")
-        meta_bits.append(mode)
-        if ref_images:
-            meta_bits.append(f"参考图×{len(ref_images)}")
-        logger.info(
-            f"[gpt_image] start adobe2api model={model_id} mode={mode} "
-            f"refs={len(ref_images)} {redact_prompt(prompt)}"
-        )
-        await self._notify(event, f"🎨 生成中…（{' · '.join(meta_bits)}）")
-
-        # Launch background generation to avoid tool timeout (120s)
-        # and keep handler responsive
-        task = asyncio.create_task(self._generate_and_deliver(
-            event=event,
-            client=client,
-            prompt=prompt,
-            model_id=model_id,
-            ref_images=ref_images,
-            reserved=reserved,
-            res_date=res_date,
-            limit=limit,
-            analyze=analyze,
-            mode=mode,
-        ))
-        self._bg_tasks.add(task)
-        task.add_done_callback(self._on_bg_task_done)
-        return
+        finally:
+            if not transferred:
+                if reserved:
+                    self.quota.refund(
+                        self._user_id(event), reservation_date=res_date
+                    )
+                self._release_admission()
 
     async def _generate_and_deliver(
         self,
@@ -1135,11 +1161,13 @@ class GptImagePlugin(Star):
             #    hogging global slots that other users could otherwise use.
             await user_sem.acquire()
             acquired_user = True
+            self._inc_user(uid)
 
             # 2) Per-group next (same rationale for groups).
             if group_sem is not None:
                 await group_sem.acquire()
                 acquired_group = True
+                self._inc_group(gid)
 
             # 3) Global last. If contended, tell the user we're waiting.
             if global_sem is not None and global_sem.locked():
@@ -1236,16 +1264,27 @@ class GptImagePlugin(Star):
                 global_sem.release()
             if acquired_group and group_sem is not None:
                 group_sem.release()
-                self._release_group_sem(gid, group_sem)
+                self._dec_group(gid)
             if acquired_user:
                 user_sem.release()
-                self._release_user_sem(uid, user_sem)
+                self._dec_user(uid)
 
             # Release the admission slot exactly once. This is the
             # single budget that caps running + waiting tasks.
             if not admission_released:
                 self._release_admission()
                 admission_released = True
+
+            # Mark the task as cleaned-up so _on_bg_task_done doesn't
+            # do a second refund + admission release when it sees
+            # task.cancelled() == True (which happens when CancelledError
+            # propagates out of this finally block).
+            try:
+                task = asyncio.current_task()
+                if task is not None:
+                    task._gpt_cleaned = True  # type: ignore[attr-defined]
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # commands
@@ -1256,7 +1295,7 @@ class GptImagePlugin(Star):
     # 因此用 regex 做主入口（不受 wake_prefix 制约，自行判断是否接管）。
 
     @filter.regex(
-        r"(?is)^[/!！.．]?(?:gpt改图|gpt编辑|gptedit|gedit|改图|"
+        r"(?is)^[/!！.．]?(?:gpt改图|gpt编辑|gptedit|gpt_edit|gedit|改图|"
         r"gpt图|gptimage|gimg|gptimg|gpt_image|"
         r"gpt图次数|gptimagequota|gimgquota|gpt额度|"
         r"gpt图帮助|gptimagehelp|gimghelp)"
@@ -1312,10 +1351,12 @@ class GptImagePlugin(Star):
     async def cmd_alias_entry(self, event: AstrMessageEvent):
         """Fallback handler for user-configured command aliases.
 
-        Uses a broad regex to catch any /command prefix, then checks
-        against configured aliases. Does NOT stop_event for non-matches,
-        so other plugins' commands are unaffected.
+        Early-returns if no aliases are configured, so the broad regex
+        has zero overhead for deployments that don't use custom aliases.
         """
+        aliases = str(self._cfg("command_alias", "") or "")
+        if not aliases.strip():
+            return
         text = self._raw_message_text(event)
         if (
             _CMD_GEN_RE.search(text)
@@ -1367,8 +1408,14 @@ class GptImagePlugin(Star):
         if aspect_ratio:
             parts.append(f"--ratio {aspect_ratio}")
         text = " ".join(p for p in parts if p).strip()
+        yielded_any = False
         async for result in self._run_generate(event, text):
             yield result
+            yielded_any = True
+        # Only yield confirmation if _run_generate launched the background
+        # task without yielding any error/help message first.
+        if not yielded_any:
+            yield event.chain_result([Plain("图片生成任务已提交，结果将直接发送到当前会话。")])
 
     @filter.llm_tool(name="gpt_image_edit")
     async def tool_gpt_edit(
@@ -1387,7 +1434,11 @@ class GptImagePlugin(Star):
         if aspect_ratio:
             parts.append(f"--ratio {aspect_ratio}")
         text = " ".join(p for p in parts if p).strip()
+        yielded_any = False
         async for result in self._run_generate(
             event, text, require_image=True, force_edit=True
         ):
             yield result
+            yielded_any = True
+        if not yielded_any:
+            yield event.chain_result([Plain("图片编辑任务已提交，结果将直接发送到当前会话。")])
