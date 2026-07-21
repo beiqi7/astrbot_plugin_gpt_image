@@ -1,7 +1,7 @@
 # GPT Image 生图改图
 
 [![AstrBot Plugin](https://img.shields.io/badge/AstrBot-Plugin-2783DE)](https://github.com/AstrBotDevs/AstrBot)
-[![Version](https://img.shields.io/badge/version-v1.6.0-46A171)](https://github.com/serenite/astrbot_plugin_gpt_image)
+[![Version](https://img.shields.io/badge/version-v1.6.0-46A171)](https://github.com/beiqi7/astrbot_plugin_gpt_image)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](./LICENSE)
 
