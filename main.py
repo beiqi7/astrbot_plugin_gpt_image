@@ -8,6 +8,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
+from urllib.parse import urlparse
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
@@ -42,6 +43,7 @@ from .constants import (
 from .images import collect_reference_data_urls, count_image_like, probe_image_size
 from .quota import DailyQuota, today_key
 from .security import (
+    DEFAULT_MAX_IMAGE_PIXELS,
     DEFAULT_MAX_OUTPUT_BYTES,
     DEFAULT_MAX_SINGLE_IMAGE_BYTES,
     PathPolicy,
@@ -81,18 +83,52 @@ class GptImagePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         self.config = config or {}
+        self._url_policy = None
+        self._user_url_policy = None
+        self._max_single_image_bytes = DEFAULT_MAX_SINGLE_IMAGE_BYTES
+        self._max_output_bytes = DEFAULT_MAX_OUTPUT_BYTES
+        self._rebuild_policies()
         self.client = self._build_client()
         plugin_data = Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_gpt_image"
         plugin_data.mkdir(parents=True, exist_ok=True)
         self.data_dir = plugin_data / "output"
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.quota = DailyQuota(plugin_data / "daily_quota.json")
-        self._rebuild_policies()
+        self._bg_tasks: set[asyncio.Task] = set()
+
+        # Concurrency control (semaphores are created lazily so they bind
+        # to the running event loop).
+        self._global_sem: Optional[asyncio.Semaphore] = None
+        self._user_sems: dict[str, asyncio.Semaphore] = {}
+        self._group_sems: dict[str, asyncio.Semaphore] = {}
+        # Admission semaphore caps the total in-flight tasks (running +
+        # waiting) at max_concurrent_global + max_queue_length. Acquired
+        # synchronously (no await) before any work starts, so the queue
+        # limit cannot be bypassed by tasks that get stuck on per-user
+        # or per-group semaphores later.
+        self._admission_sem: Optional[asyncio.BoundedSemaphore] = None
+        self._queued_lock: Optional[asyncio.Lock] = None
 
     def _rebuild_policies(self) -> None:
-        """Build URL/path policies + size limits from config."""
+        """Build URL/path policies + size limits from config.
+
+        Four URL policies are created:
+        - _url_policy: for NapCat get_image callback URLs (may include
+          loopback whitelist from napcat_hosts).
+        - _user_url_policy: for URLs coming from the message component
+          itself (Image.url / Image.file). Strict: NEVER allows loopback
+          or private ranges, regardless of napcat_hosts config. Defends
+          against SSRF via attacker-crafted CQ Image nodes.
+        - _api_url_policy: for adobe2api requests. Same-origin as
+          base_url only. Allows LAN / loopback hosts the operator
+          explicitly configured as base_url, even when those would be
+          rejected by the generic policy.
+        - _output_url_policy: for downloading generated result images.
+          Same-origin as base_url only.
+        """
         napcat_hosts = str(
-            self._cfg("napcat_hosts", "127.0.0.1") or "127.0.0.1"
+            self._cfg("napcat_hosts", "127.0.0.1 localhost ::1")
+            or "127.0.0.1 localhost ::1"
         )
         image_suffixes = str(
             self._cfg(
@@ -101,25 +137,81 @@ class GptImagePlugin(Star):
             )
             or "qpic.cn qq.com myqcloud.com gtimg.cn"
         )
+        # NapCat callback policy: allows configured loopback host:port
         self._url_policy = UrlPolicy.from_config(
             napcat_hosts=napcat_hosts,
             image_host_suffixes=image_suffixes,
             allow_public_http=bool(self._cfg("allow_public_http", False)),
         )
+        # User-provided Image URL policy: strict, no loopback/private,
+        # AND only accepts whitelisted domain suffixes (qpic.cn etc.).
+        # Defends against SSRF via attacker-crafted CQ Image nodes and
+        # prevents the bot from being abused as an arbitrary public
+        # HTTPS proxy.
+        self._user_url_policy = UrlPolicy.from_config(
+            napcat_hosts="",  # explicit: no loopback whitelist
+            image_host_suffixes=image_suffixes,
+            allow_public_http=bool(self._cfg("allow_public_http", False)),
+            strict_public_only=True,
+            allow_other_public_https=False,
+        )
+        # base_url host:port (computed once, used by both api + output
+        # policies). This is what lets operators point at a LAN address
+        # like http://192.168.1.20:6001 without the ValidatingResolver
+        # rejecting it as a private IP.
+        base_host_port = ""
+        allow_api_http = bool(self._cfg("allow_insecure_api_http", False))
+        try:
+            base_parsed = urlparse(str(self._cfg("base_url", "") or ""))
+            base_host = (base_parsed.hostname or "").lower()
+            if base_host:
+                base_port = base_parsed.port
+                if base_port is None:
+                    base_port = 443 if base_parsed.scheme == "https" else 80
+                base_host_port = f"{base_host}:{base_port}"
+        except Exception as e:
+            logger.warning(f"[gpt_image] failed to parse base_url: {e}")
+        # API policy: only base_url's exact host:port. allow_public_http
+        # mirrors allow_insecure_api_http so a private/LAN base_url can
+        # be reached over plain HTTP when the operator opted in.
+        self._api_url_policy = UrlPolicy.from_config(
+            napcat_hosts=base_host_port,
+            image_host_suffixes="",
+            allow_public_http=allow_api_http,
+        )
+        # Output image policy: same as api policy (output URLs are
+        # served by adobe2api itself).
+        self._output_url_policy = UrlPolicy.from_config(
+            napcat_hosts=base_host_port,
+            image_host_suffixes=image_suffixes,
+            allow_public_http=False,
+        )
         self._path_policy = PathPolicy.from_config(
             allowed_media_dirs=str(self._cfg("allowed_media_dirs", "") or ""),
         )
         try:
-            self._max_single_image_bytes = int(
-                self._cfg("max_single_image_bytes", DEFAULT_MAX_SINGLE_IMAGE_BYTES)
-                or DEFAULT_MAX_SINGLE_IMAGE_BYTES
+            self._max_single_image_bytes = max(
+                1024,
+                min(
+                    int(
+                        self._cfg("max_single_image_bytes", DEFAULT_MAX_SINGLE_IMAGE_BYTES)
+                        or DEFAULT_MAX_SINGLE_IMAGE_BYTES
+                    ),
+                    100 * 1024 * 1024,
+                ),
             )
         except Exception:
             self._max_single_image_bytes = DEFAULT_MAX_SINGLE_IMAGE_BYTES
         try:
-            self._max_output_bytes = int(
-                self._cfg("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)
-                or DEFAULT_MAX_OUTPUT_BYTES
+            self._max_output_bytes = max(
+                1024,
+                min(
+                    int(
+                        self._cfg("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)
+                        or DEFAULT_MAX_OUTPUT_BYTES
+                    ),
+                    200 * 1024 * 1024,
+                ),
             )
         except Exception:
             self._max_output_bytes = DEFAULT_MAX_OUTPUT_BYTES
@@ -135,13 +227,21 @@ class GptImagePlugin(Star):
             return default
 
     def _build_client(self) -> Adobe2APIClient:
-        return Adobe2APIClient(
+        client = Adobe2APIClient(
             base_url=str(self._cfg("base_url", "") or ""),
             api_key=str(self._cfg("api_key", "") or ""),
-            timeout=float(self._cfg("request_timeout", 300) or 300),
-            max_retries=int(self._cfg("max_retries", 2) or 0),
-            retry_backoff=float(self._cfg("retry_backoff", 3) or 3),
+            timeout=max(10.0, min(float(self._cfg("request_timeout", 300) or 300), 3600)),
+            max_retries=max(0, min(int(self._cfg("max_retries", 1) or 0), 10)),
+            retry_backoff=max(0.5, min(float(self._cfg("retry_backoff", 2) or 2), 60)),
+            # API session uses the api policy (whitelists base_url host:port
+            # so LAN/loopback deployments work). Output downloads use the
+            # separate output policy.
+            url_policy=getattr(self, "_api_url_policy", None),
         )
+        client.set_max_output_bytes(getattr(self, "_max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES))
+        client.set_allow_insecure_http(bool(self._cfg("allow_insecure_api_http", False)))
+        client.set_output_url_policy(getattr(self, "_output_url_policy", None))
+        return client
 
     def _reload_client_if_needed(self) -> None:
         self._rebuild_policies()
@@ -155,7 +255,19 @@ class GptImagePlugin(Star):
             or abs(new.retry_backoff - old.retry_backoff) > 1e-6
         )
         if not changed:
+            old.set_url_policy(self._api_url_policy)
+            old.set_output_url_policy(self._output_url_policy)
+            old.set_max_output_bytes(self._max_output_bytes)
+            old.set_allow_insecure_http(
+                bool(self._cfg("allow_insecure_api_http", False))
+            )
             return
+        new.set_url_policy(self._api_url_policy)
+        new.set_output_url_policy(self._output_url_policy)
+        new.set_max_output_bytes(self._max_output_bytes)
+        new.set_allow_insecure_http(
+            bool(self._cfg("allow_insecure_api_http", False))
+        )
         self.client = new
         try:
             loop = asyncio.get_running_loop()
@@ -168,16 +280,22 @@ class GptImagePlugin(Star):
                 pass
 
     async def initialize(self):
+        self._rebuild_policies()
+        self._reload_client_if_needed()
         limit = self._daily_limit_value()
         if self.client.configured():
             logger.info(
-                f"GPT Image 插件已加载：{self.client.base_url} "
+                f"[gpt_image] loaded: {redact_url(self.client.base_url)} "
                 f"(daily_limit={limit}, retries={self.client.max_retries})"
             )
         else:
-            logger.warning("GPT Image 插件未配置 base_url，请在 WebUI 插件配置中填写")
+            logger.warning("[gpt_image] base_url not configured")
 
     async def terminate(self):
+        for task in list(self._bg_tasks):
+            task.cancel()
+        await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+        self._bg_tasks.clear()
         await self.client.close()
 
     # ------------------------------------------------------------------
@@ -188,6 +306,44 @@ class GptImagePlugin(Star):
         raw = str(self._cfg("allowed_users", "") or "")
         parts = re.split(r"[\s,;，；]+", raw)
         return {p.strip() for p in parts if p.strip()}
+
+    def _denied_user_ids(self) -> set[str]:
+        raw = str(self._cfg("denied_users", "") or "")
+        parts = re.split(r"[\s,;，；]+", raw)
+        return {p.strip() for p in parts if p.strip()}
+
+    def _allowed_groups(self) -> set[str]:
+        raw = str(self._cfg("allowed_groups", "") or "")
+        parts = re.split(r"[\s,;，；]+", raw)
+        return {p.strip() for p in parts if p.strip()}
+
+    def _denied_groups(self) -> set[str]:
+        raw = str(self._cfg("denied_groups", "") or "")
+        parts = re.split(r"[\s,;，；]+", raw)
+        return {p.strip() for p in parts if p.strip()}
+
+    def _group_id(self, event: AstrMessageEvent) -> str:
+        """Return group id for group messages, empty string for private."""
+        for attr in ("get_group_id", "group_id"):
+            try:
+                v = getattr(event, attr, None)
+                if callable(v):
+                    v = v()
+                if v is not None and str(v).strip():
+                    return str(v).strip()
+            except Exception:
+                continue
+        try:
+            mo = getattr(event, "message_obj", None)
+            gid = getattr(mo, "group_id", None)
+            if gid is not None and str(gid).strip():
+                return str(gid).strip()
+        except Exception:
+            pass
+        return ""
+
+    def _is_private_chat(self, event: AstrMessageEvent) -> bool:
+        return not self._group_id(event)
 
     def _is_admin(self, event: AstrMessageEvent) -> bool:
         try:
@@ -212,21 +368,37 @@ class GptImagePlugin(Star):
         return self._daily_limit_value()
 
     def _check_permission(self, event: AstrMessageEvent) -> tuple[bool, str]:
+        is_admin = self._is_admin(event)
+        # Admin always bypasses group/private/user restrictions
+        if is_admin:
+            return True, ""
+
+        # Personal blacklist: highest priority among non-admin checks.
+        sender = self._user_id(event)
+        if sender and sender in self._denied_user_ids():
+            return False, "⛔ 你已被禁止使用该功能。"
+
+        # Private chat gate
+        if self._is_private_chat(event):
+            if not bool(self._cfg("allow_private_chat", True)):
+                return False, "⛔ 私聊已禁用，请在允许的群聊中使用。"
+        else:
+            gid = self._group_id(event)
+            denied = self._denied_groups()
+            if gid and gid in denied:
+                return False, "⛔ 本群已被禁用该功能。"
+            allowed = self._allowed_groups()
+            if allowed and gid not in allowed:
+                return False, "⛔ 本群不在允许使用的名单中。"
+
         mode = str(self._cfg("permission_mode", "all") or "all").lower()
         if mode in ("", "all", "everyone", "public"):
             return True, ""
 
-        sender = self._user_id(event)
-        is_admin = self._is_admin(event)
-
         if mode in ("admin", "admins", "管理员"):
-            if is_admin:
-                return True, ""
             return False, "⛔ 此指令仅 AstrBot 全局管理员可用。"
 
         if mode in ("whitelist", "wl", "白名单"):
-            if is_admin:
-                return True, ""
             if sender and sender in self._whitelist_ids():
                 return True, ""
             return False, "⛔ 你不在白名单中，无法使用 GPT Image 生图。"
@@ -280,9 +452,11 @@ class GptImagePlugin(Star):
 
     def _extract_prompt_text(self, event: AstrMessageEvent, *, edit: bool = False) -> str:
         """
-        去掉指令前缀。支持 `/gpt图给她换装`（中文指令后无空格）。
+        Strip command prefix. Supports `/gpt图她换装` (no space after Chinese command).
+        Only strips configured aliases if no built-in command was matched.
         """
         text = self._raw_message_text(event)
+        original = text
         if edit:
             text = re.sub(
                 r"^[/!！.．]?(?:gpt改图|gpt编辑|gptedit|gedit|gpt_edit|改图)\s*",
@@ -299,7 +473,6 @@ class GptImagePlugin(Star):
                 count=1,
                 flags=re.IGNORECASE,
             )
-            # gpt图 后可直接接中文，\s* 允许零空格
             text = re.sub(
                 r"^[/!！.．]?gpt图\s*",
                 "",
@@ -307,18 +480,20 @@ class GptImagePlugin(Star):
                 count=1,
                 flags=re.IGNORECASE,
             )
-        aliases = str(self._cfg("command_alias", "") or "")
-        for alias in re.split(r"[\s,;，；]+", aliases):
-            alias = alias.strip()
-            if not alias:
-                continue
-            text = re.sub(
-                rf"^[/!！.．]?{re.escape(alias)}\s*",
-                "",
-                text,
-                count=1,
-                flags=re.IGNORECASE,
-            )
+        # Only strip aliases if no built-in command was matched
+        if text == original:
+            aliases = str(self._cfg("command_alias", "") or "")
+            for alias in re.split(r"[\s,;，；]+", aliases):
+                alias = alias.strip()
+                if not alias:
+                    continue
+                text = re.sub(
+                    rf"^[/!！.．]?{re.escape(alias)}\s*",
+                    "",
+                    text,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
         return text.strip()
 
     def _should_handle_as_command(self, event: AstrMessageEvent) -> bool:
@@ -411,8 +586,11 @@ class GptImagePlugin(Star):
             event,
             max_images=self._max_ref_images(),
             url_policy=self._url_policy,
+            user_url_policy=self._user_url_policy,
             path_policy=self._path_policy,
             max_single_bytes=self._max_single_image_bytes,
+            max_pixels=DEFAULT_MAX_IMAGE_PIXELS,
+            reject_animated=bool(self._cfg("reject_animated_images", True)),
         )
 
     async def _cleanup_old_files(self, minutes: int = 30) -> None:
@@ -426,6 +604,155 @@ class GptImagePlugin(Star):
                     pass
         except Exception as e:
             logger.debug(f"清理临时图失败: {e}")
+
+    # ------------------------------------------------------------------
+    # concurrency control
+    # ------------------------------------------------------------------
+
+    def _cfg_int(self, key: str, default: int, *, lo: int = 1, hi: int = 1024) -> int:
+        # NOTE: `or default` would turn a legitimate 0 into the default,
+        # so we treat empty/None specially.
+        raw = self._cfg(key, default)
+        if raw is None or raw == "":
+            v = int(default)
+        else:
+            try:
+                v = int(raw)
+            except Exception:
+                v = int(default)
+        return max(lo, min(v, hi))
+
+    def _global_capacity(self) -> int:
+        return self._cfg_int("max_concurrent_global", 2, lo=1, hi=64)
+
+    def _user_capacity(self) -> int:
+        return self._cfg_int("max_concurrent_per_user", 1, lo=1, hi=64)
+
+    def _group_capacity(self) -> int:
+        return self._cfg_int("max_concurrent_per_group", 1, lo=1, hi=64)
+
+    def _queue_capacity(self) -> int:
+        # Number of tasks that may sit waiting for semaphores in addition
+        # to the ones currently running. lo=0 means "no queue at all;
+        # accept only what can start immediately".
+        return self._cfg_int("max_queue_length", 10, lo=0, hi=1024)
+
+    def _admission_capacity(self) -> int:
+        # Total in-flight tasks allowed (running + waiting).
+        return max(1, self._global_capacity() + self._queue_capacity())
+
+    def _ensure_concurrency(self) -> None:
+        if self._global_sem is None:
+            self._global_sem = asyncio.Semaphore(self._global_capacity())
+        if self._admission_sem is None:
+            self._admission_sem = asyncio.BoundedSemaphore(
+                self._admission_capacity()
+            )
+        if self._queued_lock is None:
+            self._queued_lock = asyncio.Lock()
+
+    def _get_user_sem(self, uid: str) -> asyncio.Semaphore:
+        sem = self._user_sems.get(uid)
+        if sem is None:
+            sem = asyncio.Semaphore(self._user_capacity())
+            # Stash initial capacity so _sem_is_idle can detect idle
+            # semaphores across Python versions (3.10 added _bound_value,
+            # earlier versions only expose the current _value).
+            setattr(sem, "_gpt_capacity", self._user_capacity())
+            self._user_sems[uid] = sem
+        return sem
+
+    def _get_group_sem(self, gid: str) -> asyncio.Semaphore:
+        sem = self._group_sems.get(gid)
+        if sem is None:
+            sem = asyncio.Semaphore(self._group_capacity())
+            setattr(sem, "_gpt_capacity", self._group_capacity())
+            self._group_sems[gid] = sem
+        return sem
+
+    @staticmethod
+    def _sem_is_idle(sem: asyncio.Semaphore) -> bool:
+        """True iff the semaphore is at full capacity and has no waiters.
+
+        Used to reap per-user / per-group semaphores so a public bot
+        processing many distinct accounts / groups doesn't leak memory.
+        """
+        try:
+            value = getattr(sem, "_value", 0)
+            capacity = (
+                getattr(sem, "_gpt_capacity", None)
+                or getattr(sem, "_bound_value", None)
+                or value
+            )
+            if value < capacity:
+                return False
+            waiters = getattr(sem, "_waiters", None)
+            if waiters and len(waiters) > 0:
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _release_user_sem(self, uid: str, sem: asyncio.Semaphore) -> None:
+        if uid in self._user_sems and self._sem_is_idle(sem):
+            self._user_sems.pop(uid, None)
+
+    def _release_group_sem(self, gid: str, sem: asyncio.Semaphore) -> None:
+        if gid in self._group_sems and self._sem_is_idle(sem):
+            self._group_sems.pop(gid, None)
+
+    async def _try_admit(self) -> bool:
+        """Try to acquire an admission slot without waiting.
+
+        Returns True iff a slot was acquired. The caller MUST release it
+        via `_release_admission()` on every exit path (success, failure,
+        cancellation).
+
+        This is the single gate that enforces `max_concurrent_global +
+        max_queue_length`. It closes the bypass where a task that would
+        block on a per-user / per-group semaphore was incorrectly
+        classified as "not waiting" and let in without consuming a slot.
+        """
+        self._ensure_concurrency()
+        sem = self._admission_sem  # type: ignore[union-attr]
+        # asyncio is single-threaded: no other coroutine can run between
+        # this check and the acquire() call (no await in between), so
+        # the check-then-acquire is atomic. If _value > 0, acquire()
+        # won't suspend and will just decrement _value synchronously.
+        if getattr(sem, "_value", 0) <= 0:
+            return False
+        await sem.acquire()
+        return True
+
+    def _release_admission(self) -> None:
+        if self._admission_sem is not None:
+            try:
+                self._admission_sem.release()
+            except ValueError:
+                # Already at bound; ignore (defensive).
+                pass
+
+    def _on_bg_task_done(self, task: asyncio.Task) -> None:
+        """Retrieve task exception so it isn't dropped silently.
+
+        `_generate_and_deliver` already catches its own errors and
+        refunds the quota in `finally`; this callback exists solely so
+        Python doesn't log 'Task exception was never retrieved' when the
+        finally block itself (or an unexpected place) raises.
+        """
+        self._bg_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            return
+        if exc is not None:
+            logger.error(
+                f"[gpt_image] background task exited with {type(exc).__name__}: {exc}"
+            )
 
     # ------------------------------------------------------------------
     # core generation pipeline
@@ -483,21 +810,27 @@ class GptImagePlugin(Star):
         manual_ratio = parse_ratio_token(str(overrides.get("ratio") or ""))
 
         audit_failure_policy = str(
-            self._cfg("audit_failure_policy", "keyword_only") or "keyword_only"
+            self._cfg("audit_failure_policy", "block") or "block"
         ).strip().lower()
         if audit_failure_policy not in ("block", "keyword_only", "allow"):
-            audit_failure_policy = "keyword_only"
+            audit_failure_policy = "block"
 
         audit_system_prompt = str(self._cfg("audit_prompt", "") or "").strip()
         audit_provider_id = str(self._cfg("audit_provider_id", "") or "").strip()
+        # Only send reference images to the audit model when the operator
+        # has opted in (audit model must support vision).
+        audit_refs: list[str] = []
+        if ref_images and bool(self._cfg("audit_reference_images", False)):
+            audit_refs = list(ref_images)
         analyze_kwargs = dict(
             umo=getattr(event, "unified_msg_origin", None),
-            strict=bool(self._cfg("audit_strict", True)),
+            strict=bool(self._cfg("audit_strict", False)),
             timeout=float(self._cfg("llm_timeout", 45) or 45),
             system_prompt=audit_system_prompt or None,
             enable_keyword_filter=bool(self._cfg("enable_keyword_filter", True)),
             provider_id=audit_provider_id or None,
             audit_failure_policy=audit_failure_policy,
+            image_urls=audit_refs,
         )
 
         # Determine if LLM is needed: for audit, for resolution, or for aspect ratio
@@ -527,16 +860,16 @@ class GptImagePlugin(Star):
         if not analyze.allowed:
             return analyze, user_prompt, "", None
 
-        # Aspect ratio post-processing
+        # Aspect ratio post-processing (priority order):
+        #   1. manual --ratio
+        #   2. ref_images actual ratio (edit mode preserves original aspect)
+        #   3. auto_aspect off -> default ratio
+        #   4. LLM-selected ratio (already set by llm_analyze)
         if manual_ratio:
             analyze.aspect_ratio = manual_ratio
             if "manual" not in analyze.source:
                 analyze.source = f"{analyze.source}+manual"
-        elif not auto_aspect:
-            # auto_aspect off: use default ratio (LLM ratio ignored)
-            analyze.aspect_ratio = default_ratio
         elif ref_images:
-            # 改图：默认按参考图原始比例。用第一张即可；多图时以主图为准。
             ref_ratio = None
             for ref in ref_images:
                 size = probe_image_size(ref)
@@ -544,13 +877,17 @@ class GptImagePlugin(Star):
                     w, h = size
                     ref_ratio = nearest_ratio(w, h)
                     logger.info(
-                        f"[gpt_image] 参考图尺寸 {w}x{h} → 使用比例 {ref_ratio}"
+                        f"[gpt_image] ref image {w}x{h} -> ratio {ref_ratio}"
                     )
                     break
             if ref_ratio:
                 analyze.aspect_ratio = ref_ratio
                 if "ref" not in analyze.source:
                     analyze.source = f"{analyze.source}+ref"
+            elif not auto_aspect:
+                analyze.aspect_ratio = default_ratio
+        elif not auto_aspect:
+            analyze.aspect_ratio = default_ratio
 
         if analyze.aspect_ratio not in GPT_IMAGE_RATIOS:
             analyze.aspect_ratio = default_ratio
@@ -581,14 +918,16 @@ class GptImagePlugin(Star):
         - 有参考图时走 adobe2api 图生图（chat completions + image_url）
         - 用户原文仍原样作为 prompt，LLM 只审核+选模型
         """
-        self._reload_client_if_needed()
+        # Use the current client (no per-request reload to avoid race conditions).
+        # Config changes require plugin reload via AstrBot WebUI.
+        client = self.client
 
         ok, deny = self._check_permission(event)
         if not ok:
             yield self._quoted_plain(event, deny)
             return
 
-        if not self.client.configured():
+        if not client.configured():
             yield self._quoted_plain(
                 event,
                 "⚠️ 未配置 adobe2api 地址。请在插件配置中填写 base_url 与 api_key。",
@@ -598,6 +937,15 @@ class GptImagePlugin(Star):
         text = (raw_text or "").strip()
         if not text or text in {"help", "帮助", "?", "？"}:
             yield self._quoted_plain(event, HELP_TEXT)
+            return
+
+        # Prompt length limit
+        MAX_PROMPT_LEN = 2000
+        if len(text) > MAX_PROMPT_LEN:
+            yield self._quoted_plain(
+                event,
+                f"❌ 描述过长（{len(text)} 字），请缩短到 {MAX_PROMPT_LEN} 字以内。",
+            )
             return
 
         # 先收参考图（改图指令必须有图）
@@ -630,14 +978,29 @@ class GptImagePlugin(Star):
         # Atomic quota reservation (replaces check-then-consume)
         limit = self._quota_limit_for(event)
         reserved = False
+        res_date = ""
         if limit >= 0:
-            ok_q, _ = self.quota.reserve(self._user_id(event), limit)
+            ok_q, _, res_date = self.quota.reserve(self._user_id(event), limit)
             if not ok_q:
                 yield self._quoted_plain(
                     event, "今日次数已用完，请明天再试。"
                 )
                 return
             reserved = True
+
+        # Admission slot caps total in-flight tasks at
+        # max_concurrent_global + max_queue_length. Acquired non-blockingly
+        # here so a full budget is rejected immediately (with refund)
+        # rather than silently queued.
+        admitted = await self._try_admit()
+        if not admitted:
+            if reserved:
+                self.quota.refund(self._user_id(event), reservation_date=res_date)
+            yield self._quoted_plain(
+                event,
+                "⏳ 当前排队人数过多，稍后再试（已退还本次次数）。",
+            )
+            return
 
         # Progress notification via send (avoids recall plugins)
         await self._notify(
@@ -647,17 +1010,38 @@ class GptImagePlugin(Star):
             else "⏳ 正在生图…",
         )
 
-        analyze, prompt, model_id, err = await self._analyze_and_build(
-            event, text, ref_images=ref_images or None
-        )
+        analyze = None
+        prompt = ""
+        model_id = ""
+        err = ""
+        try:
+            analyze, prompt, model_id, err = await self._analyze_and_build(
+                event, text, ref_images=ref_images or None
+            )
+        except asyncio.CancelledError:
+            if reserved:
+                self.quota.refund(self._user_id(event), reservation_date=res_date)
+            self._release_admission()
+            logger.warning("[gpt_image] analyze cancelled")
+            raise
+        except Exception:
+            if reserved:
+                self.quota.refund(self._user_id(event), reservation_date=res_date)
+            self._release_admission()
+            logger.exception("[gpt_image] analyze failed")
+            yield self._quoted_plain(event, "❌ 分析失败，请稍后再试。")
+            return
+
         if err:
             if reserved:
-                self.quota.refund(self._user_id(event))
+                self.quota.refund(self._user_id(event), reservation_date=res_date)
+            self._release_admission()
             yield self._quoted_plain(event, err)
             return
         if analyze is not None and not analyze.allowed:
             if reserved:
-                self.quota.refund(self._user_id(event))
+                self.quota.refund(self._user_id(event), reservation_date=res_date)
+            self._release_admission()
             logger.info(
                 f"[gpt_image] request blocked user={self._user_id(event)} "
                 f"reason={analyze.reason}"
@@ -666,7 +1050,8 @@ class GptImagePlugin(Star):
             return
         if not model_id or not prompt:
             if reserved:
-                self.quota.refund(self._user_id(event))
+                self.quota.refund(self._user_id(event), reservation_date=res_date)
+            self._release_admission()
             yield self._quoted_plain(event, "参数解析失败，请换一种描述再试。")
             return
 
@@ -684,78 +1069,183 @@ class GptImagePlugin(Star):
         )
         await self._notify(event, f"🎨 生成中…（{' · '.join(meta_bits)}）")
 
+        # Launch background generation to avoid tool timeout (120s)
+        # and keep handler responsive
+        task = asyncio.create_task(self._generate_and_deliver(
+            event=event,
+            client=client,
+            prompt=prompt,
+            model_id=model_id,
+            ref_images=ref_images,
+            reserved=reserved,
+            res_date=res_date,
+            limit=limit,
+            analyze=analyze,
+            mode=mode,
+        ))
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._on_bg_task_done)
+        return
+
+    async def _generate_and_deliver(
+        self,
+        event: AstrMessageEvent,
+        client: Adobe2APIClient,
+        prompt: str,
+        model_id: str,
+        ref_images: list[str],
+        reserved: bool,
+        res_date: str,
+        limit: int,
+        analyze: Optional[AnalyzeResult],
+        mode: str,
+    ) -> None:
+        """Background task: generate image, send result, handle errors.
+
+        Concurrency: acquires per-user, per-group and global semaphores
+        in that order (finest-grained first) so one user's queued task
+        cannot occupy a global slot while blocked on their per-user cap.
+
+        Admission slot: already acquired by the caller before launching
+        this task. We release it exactly once in `finally`.
+
+        Refund invariant: `refund_needed` stays True until the result is
+        successfully delivered. Every exit path (cancellation during any
+        await, exception, plugin shutdown, send failure) hits `finally`,
+        which refunds the quota if still needed, releases only the
+        semaphores we actually acquired, and releases the admission slot.
+        """
+
+        uid = self._user_id(event)
+        gid = self._group_id(event)  # empty for private chats
+
+        self._ensure_concurrency()
+        global_sem = self._global_sem
+        user_sem = self._get_user_sem(uid)
+        group_sem = self._get_group_sem(gid) if gid else None
+
+        acquired_user = False
+        acquired_group = False
+        acquired_global = False
+        admission_released = False
+        refund_needed = True
+
         try:
-            result = await self.client.generate_image(
-                prompt=prompt,
-                model=model_id,
-                image_data_urls=ref_images or None,
-                timeout=float(self._cfg("request_timeout", 300) or 300),
-            )
-        except Adobe2APIError as e:
-            if reserved:
-                self.quota.refund(self._user_id(event))
-            logger.error(f"[gpt_image] generate failed: {e}")
-            yield self._quoted_plain(event, self._format_user_error(e))
-            return
-        except Exception as e:
-            if reserved:
-                self.quota.refund(self._user_id(event))
-            logger.exception("[gpt_image] unexpected error")
-            yield self._quoted_plain(event, self._format_user_error(e))
-            return
+            # 1) Per-user first: bounds one user's queue depth without
+            #    hogging global slots that other users could otherwise use.
+            await user_sem.acquire()
+            acquired_user = True
 
-        logger.info(f"[gpt_image] adobe2api ok model={result.get('model')}")
+            # 2) Per-group next (same rationale for groups).
+            if group_sem is not None:
+                await group_sem.acquire()
+                acquired_group = True
 
-        new_used = self.quota.get_used(self._user_id(event))
-
-        footer_parts: list[str] = []
-        if bool(self._cfg("show_meta", True)) and analyze:
-            footer_parts.append(
-                f"{analyze.resolution.upper()} · {analyze.aspect_ratio} · {mode}"
-            )
-        if limit >= 0:
-            remain = max(0, limit - new_used)
-            footer_parts.append(f"今日还可生成 {remain} 次（已用 {new_used}/{limit}）")
-        footer = "\n".join(footer_parts)
-
-        await self._cleanup_old_files()
-        stem = f"gpt_image_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-        try:
-            path = await self.client.save_result_image(
-                result, self.data_dir, stem, max_bytes=self._max_output_bytes
-            )
-        except Exception as e:
-            logger.warning(f"[gpt_image] save failed, trying direct URL: {e}")
-            if result.get("url"):
-                chain = []
-                if footer:
-                    chain.append(Plain(f"✅ 生成完成\n{footer}\n"))
-                chain.append(Image.fromURL(str(result["url"])))
-                quoted = self._with_user_quote(event, chain)
+            # 3) Global last. If contended, tell the user we're waiting.
+            if global_sem is not None and global_sem.locked():
                 try:
-                    await event.send(MessageChain(chain=quoted))
+                    await self._notify(
+                        event, "⏳ 前面有其他生图任务，正在排队…"
+                    )
                 except Exception:
                     pass
-                yield event.chain_result(quoted)
-                return
-            yield self._quoted_plain(event, "❌ 图片保存失败，请稍后再试。")
-            return
+            await global_sem.acquire()  # type: ignore[union-attr]
+            acquired_global = True
 
-        chain = []
-        if footer:
-            chain.append(Plain(f"✅ 生成完成\n{footer}\n"))
-        chain.append(Image.fromFileSystem(str(path)))
-        quoted = self._with_user_quote(event, chain)
-        try:
-            await event.send(MessageChain(chain=quoted))
-            logger.info(f"[gpt_image] result sent path={redact_path(path)}")
-        except Exception as e:
-            logger.warning(f"[gpt_image] send failed, fallback yield: {e}")
-            yield event.chain_result(quoted)
-            return
-        # 已 send，再给一个空/轻量结果避免框架报未返回
-        # 不重复发图：只 yield 文本确认（若平台会去重也无所谓）
-        return
+            try:
+                result = await client.generate_image(
+                    prompt=prompt,
+                    model=model_id,
+                    image_data_urls=ref_images or None,
+                    timeout=float(self._cfg("request_timeout", 300) or 300),
+                )
+            except Adobe2APIError as e:
+                logger.error(f"[gpt_image] generate failed: {e}")
+                await self._notify(event, self._format_user_error(e))
+                return
+            except asyncio.CancelledError:
+                logger.warning("[gpt_image] generate cancelled")
+                raise
+            except Exception as e:
+                logger.exception("[gpt_image] unexpected error")
+                await self._notify(event, self._format_user_error(e))
+                return
+
+            logger.info(f"[gpt_image] adobe2api ok model={result.get('model')}")
+
+            new_used = self.quota.get_used(uid)
+
+            footer_parts: list[str] = []
+            if bool(self._cfg("show_meta", True)) and analyze:
+                footer_parts.append(
+                    f"{analyze.resolution.upper()} · {analyze.aspect_ratio} · {mode}"
+                )
+            if limit >= 0:
+                remain = max(0, limit - new_used)
+                footer_parts.append(
+                    f"今日还可生成 {remain} 次（已用 {new_used}/{limit}）"
+                )
+            footer = "\n".join(footer_parts)
+
+            await self._cleanup_old_files()
+            stem = (
+                f"gpt_image_{time.strftime('%Y%m%d_%H%M%S')}_"
+                f"{uuid.uuid4().hex[:8]}"
+            )
+            try:
+                path = await client.save_result_image(
+                    result, self.data_dir, stem,
+                    max_bytes=self._max_output_bytes,
+                    max_pixels=DEFAULT_MAX_IMAGE_PIXELS,
+                )
+            except Exception as e:
+                logger.warning(f"[gpt_image] save failed: {e}")
+                await self._notify(
+                    event, "❌ 图片保存失败，已退还次数，请稍后再试。"
+                )
+                return
+
+            chain = []
+            if footer:
+                chain.append(Plain(f"✅ 生成完成\n{footer}\n"))
+            chain.append(Image.fromFileSystem(str(path)))
+            quoted = self._with_user_quote(event, chain)
+            try:
+                await event.send(MessageChain(chain=quoted))
+                logger.info(f"[gpt_image] result sent path={redact_path(path)}")
+                # Delivery successful — commit the quota deduction.
+                refund_needed = False
+            except Exception as e:
+                logger.warning(f"[gpt_image] send failed: {e}")
+                # refund_needed stays True, finally will refund.
+        finally:
+            # Refund on every non-delivered exit.
+            if refund_needed and reserved:
+                try:
+                    self.quota.refund(uid, reservation_date=res_date)
+                    logger.info(
+                        f"[gpt_image] refunded quota user={uid} "
+                        f"(not delivered)"
+                    )
+                except Exception as e:
+                    logger.warning(f"[gpt_image] refund failed: {e}")
+
+            # Release only the semaphores we actually acquired,
+            # in reverse acquisition order.
+            if acquired_global and global_sem is not None:
+                global_sem.release()
+            if acquired_group and group_sem is not None:
+                group_sem.release()
+                self._release_group_sem(gid, group_sem)
+            if acquired_user:
+                user_sem.release()
+                self._release_user_sem(uid, user_sem)
+
+            # Release the admission slot exactly once. This is the
+            # single budget that caps running + waiting tasks.
+            if not admission_released:
+                self._release_admission()
+                admission_released = True
 
     # ------------------------------------------------------------------
     # commands
@@ -817,6 +1307,48 @@ class GptImagePlugin(Star):
             async for result in self._run_generate(event, prompt):
                 yield result
             return
+
+    @filter.regex(r"(?is)^[/!！.．]\S+")
+    async def cmd_alias_entry(self, event: AstrMessageEvent):
+        """Fallback handler for user-configured command aliases.
+
+        Uses a broad regex to catch any /command prefix, then checks
+        against configured aliases. Does NOT stop_event for non-matches,
+        so other plugins' commands are unaffected.
+        """
+        text = self._raw_message_text(event)
+        if (
+            _CMD_GEN_RE.search(text)
+            or _CMD_EDIT_RE.search(text)
+            or _CMD_QUOTA_RE.match(text)
+            or _CMD_HELP_RE.match(text)
+        ):
+            return
+
+        aliases = str(self._cfg("command_alias", "") or "")
+        matched = False
+        for alias in re.split(r"[\s,;，；]+", aliases):
+            alias = alias.strip()
+            if not alias:
+                continue
+            if re.match(
+                rf"^[/!！.．]?{re.escape(alias)}(?=$|[\s,，:：])",
+                text,
+                re.IGNORECASE,
+            ):
+                matched = True
+                break
+
+        if not matched:
+            return
+        if not self._should_handle_as_command(event):
+            return
+
+        self._stop_other_handlers(event)
+        prompt = self._extract_prompt_text(event, edit=False)
+        logger.info(f"[gpt_image] alias gen {redact_prompt(prompt)}")
+        async for result in self._run_generate(event, prompt):
+            yield result
 
     @filter.llm_tool(name="gpt_image_generate")
     async def tool_gpt_image(

@@ -12,6 +12,7 @@ Security (v1.5.5+):
 
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -21,11 +22,15 @@ import aiohttp
 from astrbot.api import logger
 
 from .security import (
+    DEFAULT_MAX_IMAGE_PIXELS,
     DEFAULT_MAX_SINGLE_IMAGE_BYTES,
     MAX_HTTP_CHUNK,
     PathPolicy,
     SecurityError,
     UrlPolicy,
+    ValidatingResolver,
+    check_image_pixel_limit,
+    is_animated_image,
     is_image_bytes,
     redact_path,
     redact_url,
@@ -37,6 +42,12 @@ _NAPCAT_FILE_ID_RE = re.compile(
     r"^[A-Za-z0-9_\-]{6,}\.(jpg|jpeg|png|gif|webp|bmp)$",
     re.IGNORECASE,
 )
+
+
+def _make_resolver(url_policy: UrlPolicy | None):
+    if url_policy is None:
+        return None
+    return ValidatingResolver(url_policy)
 
 
 def _is_image_like(comp: Any) -> bool:
@@ -65,8 +76,13 @@ def _bytes_to_data_url(data: bytes, mime: str | None = None) -> str:
     mime = mime or sniff_image_mime(data) or "image/png"
     return f"data:{mime};base64,{_b64.b64encode(data).decode('ascii')}"
 
-def _decode_data_url_head(data_url: str, *, max_bytes: int = 4096) -> bytes | None:
-    """Decode just the leading bytes of a data URL for header sniffing."""
+def _decode_data_url_head(data_url: str, *, max_bytes: int = 1_048_576) -> bytes | None:
+    """Decode just the leading bytes of a data URL for header sniffing.
+
+    Default 1 MB so JPEG SOF0 markers buried under large EXIF / embedded
+    thumbnails (common in phone photos) are still reachable. Decoding
+    only the head keeps memory + CPU bounded for animated / huge inputs.
+    """
     if not data_url or ";base64," not in data_url:
         return None
     try:
@@ -82,8 +98,12 @@ def _decode_data_url_head(data_url: str, *, max_bytes: int = 4096) -> bytes | No
 
 
 def probe_image_size(data_url: str) -> tuple[int, int] | None:
-    """Return (width, height) from a data URL by parsing header bytes only."""
-    data = _decode_data_url_head(data_url, max_bytes=8192)
+    """Return (width, height) from a data URL by parsing header bytes only.
+
+    Uses up to 1 MB of decoded bytes so JPEGs with large EXIF segments
+    (SOF0 marker pushed past 8 KB) still parse correctly.
+    """
+    data = _decode_data_url_head(data_url, max_bytes=1_048_576)
     if not data or len(data) < 12:
         return None
 
@@ -168,7 +188,9 @@ def probe_image_size(data_url: str) -> tuple[int, int] | None:
     return None
 
 
-def _pure_b64_to_data_url(raw: str, *, max_bytes: int) -> str | None:
+def _pure_b64_to_data_url(
+    raw: str, *, max_bytes: int, reject_animated: bool = True
+) -> str | None:
     s = (raw or "").strip()
     if not s:
         return None
@@ -180,9 +202,13 @@ def _pure_b64_to_data_url(raw: str, *, max_bytes: int) -> str | None:
             return None
         except Exception:
             return None
-        if is_image_bytes(data):
-            return s
-        return None
+        if not is_image_bytes(data):
+            return None
+        if reject_animated and is_animated_image(data):
+            logger.warning("[gpt_image] rejected animated image (data URL)")
+            return None
+        # Regenerate with sniffed MIME instead of trusting input MIME
+        return _bytes_to_data_url(data)
     if s.startswith("base64://"):
         s = s[len("base64://") :]
     if _NAPCAT_FILE_ID_RE.match(s):
@@ -198,6 +224,9 @@ def _pure_b64_to_data_url(raw: str, *, max_bytes: int) -> str | None:
     except Exception:
         return None
     if not is_image_bytes(data):
+        return None
+    if reject_animated and is_animated_image(data):
+        logger.warning("[gpt_image] rejected animated image (raw base64)")
         return None
     return _bytes_to_data_url(data)
 
@@ -256,6 +285,7 @@ async def _napcat_get_image(
     url_policy: UrlPolicy,
     path_policy: PathPolicy,
     max_bytes: int,
+    reject_animated: bool = True,
 ) -> str | None:
     """NapCat / go-cqhttp: get_image. Returns data URL or None."""
     if not file_token or not getattr(event, "bot", None):
@@ -296,7 +326,9 @@ async def _napcat_get_image(
             for key in ("base64", "data"):
                 if resp.get(key):
                     data_url = _pure_b64_to_data_url(
-                        str(resp[key]), max_bytes=max_bytes
+                        str(resp[key]),
+                        max_bytes=max_bytes,
+                        reject_animated=reject_animated,
                     )
                     if data_url:
                         logger.info("NapCat get_image: base64 ok")
@@ -316,9 +348,15 @@ async def _napcat_get_image(
                     continue
                 except Exception:
                     continue
-                if is_image_bytes(raw):
-                    logger.info("NapCat get_image: local file ok")
-                    return _bytes_to_data_url(raw)
+                if not is_image_bytes(raw):
+                    continue
+                if reject_animated and is_animated_image(raw):
+                    logger.warning(
+                        "NapCat get_image: rejected animated image"
+                    )
+                    continue
+                logger.info("NapCat get_image: local file ok")
+                return _bytes_to_data_url(raw)
 
             url = resp.get("url")
             if url and str(url).startswith("http"):
@@ -326,6 +364,7 @@ async def _napcat_get_image(
                     str(url),
                     url_policy=url_policy,
                     max_bytes=max_bytes,
+                    reject_animated=reject_animated,
                 )
                 if got:
                     logger.info("NapCat get_image: url download ok")
@@ -338,9 +377,10 @@ async def _http_download_image(
     *,
     url_policy: UrlPolicy,
     max_bytes: int,
+    reject_animated: bool = True,
 ) -> str | None:
     """Download an image with SSRF + size limits, streaming chunked reads."""
-    ok, reason = url_policy.validate(url)
+    ok, reason = await url_policy.validate_async(url)
     if not ok:
         logger.warning(
             f"[gpt_image] URL rejected: {reason} url={redact_url(url)}"
@@ -356,9 +396,10 @@ async def _http_download_image(
         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
     }
     try:
-        host = (urlparse(url).netloc or "").lower()
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").lower()
         if host:
-            headers["Referer"] = f"http://{host}/"
+            headers["Referer"] = f"{parsed.scheme or 'http'}://{host}/"
         if any(
             x in host
             for x in ("qpic.cn", "qq.com", "myqcloud.com", "gtimg.cn")
@@ -370,11 +411,16 @@ async def _http_download_image(
 
     timeout = aiohttp.ClientTimeout(total=30, connect=10)
     try:
+        connector = aiohttp.TCPConnector(
+            resolver=_make_resolver(url_policy),
+            limit=0,
+        )
         async with aiohttp.ClientSession(
-            headers=headers, trust_env=True, timeout=timeout
+            headers=headers, timeout=timeout, connector=connector
         ) as session:
             return await _http_download_with_redirects(
-                url, session, url_policy=url_policy, max_bytes=max_bytes
+                url, session, url_policy=url_policy,
+                max_bytes=max_bytes, reject_animated=reject_animated,
             )
     except Exception as e:
         logger.warning(f"[gpt_image] download error: {e} url={redact_url(url)}")
@@ -388,12 +434,13 @@ async def _http_download_with_redirects(
     url_policy: UrlPolicy,
     max_bytes: int,
     max_redirects: int = 5,
+    reject_animated: bool = True,
 ) -> str | None:
     """Download with manual redirect handling; re-validate every hop."""
     current = url
     visited = 0
     while visited <= max_redirects:
-        ok, reason = url_policy.validate(current)
+        ok, reason = await url_policy.validate_async(current)
         if not ok:
             logger.warning(
                 f"[gpt_image] redirect URL rejected: {reason} "
@@ -424,6 +471,11 @@ async def _http_download_with_redirects(
                     return None
 
                 mime = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+                if mime and not mime.startswith("image/"):
+                    logger.debug(
+                        f"[gpt_image] server declared non-image Content-Type "
+                        f"'{mime}', will verify by sniffing"
+                    )
                 declared_len = resp.headers.get("Content-Length", "")
                 if declared_len and declared_len.isdigit():
                     if int(declared_len) > max_bytes:
@@ -449,9 +501,18 @@ async def _http_download_with_redirects(
                         f"url={redact_url(current)}"
                     )
                     return None
-                if not mime.startswith("image/"):
-                    mime = sniff_image_mime(data)
-                return _bytes_to_data_url(data, mime)
+                if reject_animated and is_animated_image(data):
+                    logger.warning(
+                        f"[gpt_image] rejected animated image "
+                        f"url={redact_url(current)}"
+                    )
+                    return None
+                # Trust only the sniffed MIME, never the server-declared
+                # Content-Type (which can be spoofed to image/svg+xml etc.).
+                sniffed = sniff_image_mime(data)
+                if not sniffed:
+                    return None
+                return _bytes_to_data_url(data, sniffed)
         except aiohttp.ClientError as e:
             logger.warning(
                 f"[gpt_image] download client error: {e} "
@@ -472,17 +533,27 @@ async def image_component_to_data_url(
     event=None,
     *,
     url_policy: UrlPolicy | None = None,
+    user_url_policy: UrlPolicy | None = None,
     path_policy: PathPolicy | None = None,
     max_bytes: int = DEFAULT_MAX_SINGLE_IMAGE_BYTES,
+    reject_animated: bool = True,
 ) -> str | None:
     """Convert an Image component to a data URL.
 
-    Security: all HTTP downloads go through url_policy; all local file
-    reads go through path_policy. Falls back to permissive policies
-    only when caller passes None (not recommended for untrusted input).
+    Security:
+      - url_policy: policy for NapCat get_image callback URLs (may
+        allow loopback for local NapCat process).
+      - user_url_policy: policy for URLs that come directly from the
+        message component (comp.url / comp.file). MUST NOT allow
+        loopback or private ranges - defends against SSRF via
+        attacker-crafted Image components.
+      - path_policy: whitelist for local file reads.
+      - reject_animated: refuse GIF/APNG/animated WebP.
     """
     if url_policy is None:
         url_policy = UrlPolicy()
+    if user_url_policy is None:
+        user_url_policy = UrlPolicy(strict_public_only=True)
     if path_policy is None:
         path_policy = PathPolicy()
 
@@ -496,11 +567,32 @@ async def image_component_to_data_url(
         f"has_bot={bool(getattr(event, 'bot', None))}"
     )
 
-    # 1) AstrBot official: convert_to_base64
-    if hasattr(comp, "convert_to_base64"):
+    # Pre-flight: if the component carries an HTTP(S) URL that fails the
+    # strict user URL policy, refuse the whole component. Framework
+    # converters (convert_to_base64 / convert_to_file_path) may internally
+    # fetch the URL and would bypass user_url_policy - we must not hand
+    # them an attacker-crafted loopback / private URL.
+    url_precheck_rejected = False
+    if url_field.startswith(("http://", "https://")):
+        ok, reason = await user_url_policy.validate_async(url_field)
+        if not ok:
+            logger.warning(
+                f"[gpt_image] component URL rejected by pre-check: {reason} "
+                f"url={redact_url(url_field)}"
+            )
+            url_precheck_rejected = True
+
+    # 1) AstrBot official: convert_to_base64.
+    #    Skipped when the component URL is an attacker-crafted HTTP URL
+    #    that we already rejected - the framework might fetch it for us.
+    if not url_precheck_rejected and hasattr(comp, "convert_to_base64"):
         try:
             raw = await comp.convert_to_base64()
-            data_url = _pure_b64_to_data_url(str(raw or ""), max_bytes=max_bytes)
+            data_url = _pure_b64_to_data_url(
+                str(raw or ""),
+                max_bytes=max_bytes,
+                reject_animated=reject_animated,
+            )
             if data_url:
                 logger.info("[gpt_image] ok: convert_to_base64")
                 return data_url
@@ -508,16 +600,22 @@ async def image_component_to_data_url(
         except Exception as e:
             logger.warning(f"[gpt_image] convert_to_base64 failed: {e}")
 
-    # 2) convert_to_file_path
-    if hasattr(comp, "convert_to_file_path"):
+    # 2) convert_to_file_path (same skip rationale as above)
+    if not url_precheck_rejected and hasattr(comp, "convert_to_file_path"):
         try:
             fpath = await comp.convert_to_file_path()
             if fpath:
                 try:
                     raw = path_policy.read_bytes(str(fpath), max_bytes=max_bytes)
                     if is_image_bytes(raw):
-                        logger.info("[gpt_image] ok: convert_to_file_path")
-                        return _bytes_to_data_url(raw)
+                        if reject_animated and is_animated_image(raw):
+                            logger.warning(
+                                "[gpt_image] convert_to_file_path: "
+                                "rejected animated image"
+                            )
+                        else:
+                            logger.info("[gpt_image] ok: convert_to_file_path")
+                            return _bytes_to_data_url(raw)
                 except SecurityError as e:
                     logger.warning(
                         f"[gpt_image] convert_to_file_path path rejected: {e} "
@@ -526,35 +624,35 @@ async def image_component_to_data_url(
         except Exception as e:
             logger.warning(f"[gpt_image] convert_to_file_path failed: {e}")
 
-    # 3) NapCat: file as cache name -> get_image
+    # 3) NapCat: only try get_image for tokens that look like a NapCat
+    #    file id / cache name / hex hash. Do NOT feed arbitrary HTTP URLs
+    #    to get_image, because that would let an attacker-crafted Image
+    #    component reach loopback / private hosts via NapCat's downloader,
+    #    bypassing user_url_policy.
     if event is not None and getattr(event, "bot", None) is not None:
         for token in (file_field, url_field, path_field):
             if not token:
                 continue
-            if _is_napcat_file_id(token) or token.startswith("http"):
-                got = await _napcat_get_image(
-                    event,
-                    token,
-                    url_policy=url_policy,
-                    path_policy=path_policy,
-                    max_bytes=max_bytes,
-                )
-                if got:
-                    return got
-            elif not token.startswith(("data:", "base64://")):
-                got = await _napcat_get_image(
-                    event,
-                    token,
-                    url_policy=url_policy,
-                    path_policy=path_policy,
-                    max_bytes=max_bytes,
-                )
-                if got:
-                    return got
+            if token.startswith(("http://", "https://", "data:", "base64://")):
+                continue
+            if not _is_napcat_file_id(token):
+                continue
+            got = await _napcat_get_image(
+                event,
+                token,
+                url_policy=url_policy,
+                path_policy=path_policy,
+                max_bytes=max_bytes,
+                reject_animated=reject_animated,
+            )
+            if got:
+                return got
 
     # 4) Already data/base64
     for token in (file_field, url_field, path_field):
-        data_url = _pure_b64_to_data_url(token, max_bytes=max_bytes)
+        data_url = _pure_b64_to_data_url(
+            token, max_bytes=max_bytes, reject_animated=reject_animated
+        )
         if data_url:
             return data_url
 
@@ -573,19 +671,26 @@ async def image_component_to_data_url(
             continue
         except Exception:
             continue
-        if is_image_bytes(raw):
-            return _bytes_to_data_url(raw)
+        if not is_image_bytes(raw):
+            continue
+        if reject_animated and is_animated_image(raw):
+            logger.warning("[gpt_image] local file: rejected animated image")
+            continue
+        return _bytes_to_data_url(raw)
 
-    # 6) HTTP download (SSRF-checked, size-limited)
+    # 6) HTTP download from user-provided URL fields.
+    #    Uses user_url_policy (strict, no loopback) so an attacker who
+    #    crafts Image.url cannot proxy the bot to internal services.
     for token in (url_field, file_field):
         if token.startswith("http://") or token.startswith("https://"):
             got = await _http_download_image(
                 token,
-                url_policy=url_policy,
+                url_policy=user_url_policy,
                 max_bytes=max_bytes,
+                reject_animated=reject_animated,
             )
             if got:
-                logger.info("[gpt_image] ok: HTTP download")
+                logger.info("[gpt_image] ok: HTTP download (user URL)")
                 return got
 
     logger.error(
@@ -627,17 +732,25 @@ async def collect_reference_data_urls(
     *,
     max_images: int = 3,
     url_policy: UrlPolicy | None = None,
+    user_url_policy: UrlPolicy | None = None,
     path_policy: PathPolicy | None = None,
     max_single_bytes: int = DEFAULT_MAX_SINGLE_IMAGE_BYTES,
     max_total_bytes: int = 0,
+    max_pixels: int = DEFAULT_MAX_IMAGE_PIXELS,
+    reject_animated: bool = True,
 ) -> list[str]:
     """Extract reference images from event, return list of data URLs.
 
     Security:
-      - url_policy: SSRF validation for all HTTP downloads
-      - path_policy: whitelist for local file reads
-      - max_single_bytes: per-image byte cap
-      - max_total_bytes: total cap across all images (0 = use default)
+      - url_policy: policy for NapCat get_image callback URLs (trusted).
+      - user_url_policy: policy for URLs from message components
+        (untrusted). Defaults to a strict public-only policy that
+        blocks loopback/private ranges.
+      - path_policy: whitelist for local file reads.
+      - max_single_bytes: per-image byte cap.
+      - max_total_bytes: total cap across all images (0 = use default).
+      - max_pixels: per-image pixel cap (width * height).
+      - reject_animated: skip GIF/APNG/animated WebP.
     """
     max_images = max(1, min(int(max_images or 3), 8))
     if max_total_bytes <= 0:
@@ -646,6 +759,8 @@ async def collect_reference_data_urls(
         max_total_bytes = DEFAULT_MAX_TOTAL_REF_BYTES
     if url_policy is None:
         url_policy = UrlPolicy()
+    if user_url_policy is None:
+        user_url_policy = UrlPolicy(strict_public_only=True)
     if path_policy is None:
         path_policy = PathPolicy()
 
@@ -678,25 +793,44 @@ async def collect_reference_data_urls(
             comp,
             event=event,
             url_policy=url_policy,
+            user_url_policy=user_url_policy,
             path_policy=path_policy,
             max_bytes=max_single_bytes,
+            reject_animated=reject_animated,
         )
         if not data_url:
+            continue
+        # pixel limit check (decompression bomb prevention)
+        dims = probe_image_size(data_url)
+        if dims:
+            w, h = dims
+            if w * h > max_pixels:
+                logger.warning(
+                    f"[gpt_image] ref image pixels {w}x{h}={w*h} "
+                    f"> limit {max_pixels}, skipping"
+                )
+                continue
+        else:
+            # Image signature matched but dimensions unparseable -> reject
+            logger.warning(
+                "[gpt_image] ref image dimensions unparseable, skipping"
+            )
             continue
         # estimate decoded bytes from base64 length
         payload_len = len(data_url) - len(data_url.split(";base64,", 1)[0]) - 8
         est_bytes = max(0, (payload_len // 4) * 3)
+        # Dedup BEFORE consuming total_bytes quota
+        key = hashlib.sha256(data_url.encode("ascii", "ignore")).hexdigest()
+        if key in seen:
+            continue
         if total_bytes + est_bytes > max_total_bytes:
             logger.warning(
                 f"[gpt_image] total ref bytes {total_bytes + est_bytes} "
                 f"> limit {max_total_bytes}, stopping"
             )
             break
-        total_bytes += est_bytes
-        key = data_url[:180]
-        if key in seen:
-            continue
         seen.add(key)
+        total_bytes += est_bytes
         results.append(data_url)
         logger.info(
             f"[gpt_image] ref ok #{len(results)} est_bytes={est_bytes} "

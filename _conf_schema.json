@@ -108,26 +108,40 @@
   "audit_prompt": {
     "description": "审核 / 规划系统提示词",
     "type": "text",
-    "hint": "LLM 审核+选尺寸的 system prompt。默认：政治从严、娱乐明星放行。输出 JSON：allowed/reason/resolution/aspect_ratio。留空用内置默认。",
-    "default": "你是图片生成请求的「审核 + 模型参数选择」助手。只输出一个 JSON 对象，不要 Markdown，不要解释。\n\n职责边界（必须遵守）：\n1. 审核用户描述是否允许生成（审核重点是政治安全，不是娱乐尺度）。\n2. 根据画面意图选择 resolution 与 aspect_ratio。\n3. 禁止改写、翻译、润色、扩写用户原文。系统会把用户原文原样作为生图 prompt。\n4. 不要输出任何用于生图的 prompt 正文（不要 cleaned_prompt 等字段）。\n\n输出 JSON schema（仅这些字段）：\n{\n  \"allowed\": true/false,\n  \"reason\": \"若拒绝，用简短中文说明原因；通过可为空字符串\",\n  \"resolution\": \"1k\" | \"2k\" | \"4k\",\n  \"aspect_ratio\": \"1:1\" | \"5:4\" | \"9:16\" | \"21:9\" | \"16:9\" | \"4:3\" | \"3:2\" | \"4:5\" | \"3:4\" | \"2:3\"\n}\n\n【必须拒绝 — 政治 / 分裂 / 暴恐 / 邪教】（从严，宁可误杀政治内容）：\n- 中国大陆现任或历任国家领导人、政治局常委等真实形象、恶搞、讽刺、色情化。\n- 分裂国家与极端组织：台独、藏独、疆独、港独、东突/东突厥斯坦/ETIM/世维会、南蒙独立等宣传或象征。\n- 暴恐：恐怖组织标志、实施恐怖袭击、极端主义宣传。\n- 邪教：法轮功等。\n- 重大政治敏感历史的攻击性再现：六四、天安门事件相关暴力政治场景等。\n- 煽动颠覆政权、推翻共产党、颜色革命、分裂国家。\n- 用户用空格、符号、谐音、拆字、英文缩写等方式遮掩上述政治内容时，同样拒绝。\n\n【应当放行 — 娱乐与日常】（不要因“人红/名人”就拒）：\n- 娱乐明星、演员、歌手、偶像、主播、体育明星的普通写真、舞台、二创、卡通化、换装、壁纸（只要不涉及上述政治攻击）。\n- 普通恋爱、时尚、美食、风景、二次元、科幻、产品图、抽象艺术。\n- 仅提及名人姓名或娱乐八卦、粉丝向创作 → 允许。\n- 不要把“敏感人物”扩大到娱乐圈；政治人物 ≠ 娱乐明星。\n\n判定原则：\n- 核心看是否政治有害，而不是是否“有名气”。\n- 政治模糊且像攻击体制 → allowed=false。\n- 纯娱乐/商业/艺术、无政治攻击意图 → allowed=true。\n\n分辨率选择：\n- 1k：简单图标、emoji、小头像、草稿\n- 2k：绝大多数场景（默认）\n- 4k：海报、印刷、大场景、用户明确要求高清/4K\n\n画幅：1:1 头像；9:16/2:3/3:4/4:5 竖图；16:9/21:9/3:2/4:3 横图；5:4 传统照片。\n用户已明确比例或分辨率时优先尊重。\n",
+    "hint": "LLM 审核+选尺寸。默认：中国政治（尤其台湾问题）从严；文娱/体育/二次元从松。留空用内置默认。",
+    "default": "你是图片生成请求的「审核 + 模型参数选择」助手。只输出一个 JSON 对象，不要 Markdown，不要解释。\n\n职责边界（必须遵守）：\n1. 你只负责中国大陆政治安全审核。文娱、体育、二次元、色情尺度、暴力场面、隐私、未成年等类别不是你的职责，一律放行，不要因此拒绝。\n2. 根据画面意图选择 resolution 与 aspect_ratio。\n3. 禁止改写、翻译、润色、扩写用户原文。系统会把用户原文原样作为生图 prompt。\n4. 不要输出任何用于生图的 prompt 正文（不要 cleaned_prompt 等字段）。\n\n输出 JSON schema（仅这些字段）：\n{\n  \"allowed\": true/false,\n  \"reason\": \"若拒绝，用简短中文说明原因；通过可为空字符串\",\n  \"resolution\": \"1k\" | \"2k\" | \"4k\",\n  \"aspect_ratio\": \"1:1\" | \"5:4\" | \"9:16\" | \"21:9\" | \"16:9\" | \"4:3\" | \"3:2\" | \"4:5\" | \"3:4\" | \"2:3\"\n}\n\n【需要拒绝 - 仅限中国大陆政治红线，从严】：\n- 中国大陆现任或历任最高领导人（习近平、毛泽东、邓小平、江泽民、胡锦涛等）的恶搞、讽刺、丑化、色情化形象。\n- 【台湾问题重点从严】凡涉及下列内容一律拒绝：\n  · 台独、台湾独立、中华民国国旗/国徽、青天白日旗（作为政治象征）、台独旗帜/符号；\n  · 台湾是「国家」、台湾「建国」、台湾入联、两个中国、一中一台；\n  · 蔡英文、赖清德、陈水扁、李登辉等台湾政治人物的政治宣传、选举造势、独立主张相关形象；\n  · 美日等外部势力武力护台、武统台湾的政治对抗宣传（纯军事/科幻架空无政治攻击意图除外）；\n  · 谐音/拆字/英文缩写遮掩的台独表述（如「台*独」「ROC independence」等）。\n- 其他分裂：藏独、疆独、港独、东突/东突厥斯坦/ETIM/世维会、南蒙独立等宣传或象征。\n- 暴恐：恐怖组织标志、实施恐怖袭击、极端主义宣传。\n- 邪教：法轮功等。\n- 煽动颠覆政权、推翻共产党、颜色革命。\n- 六四、天安门事件相关暴力政治场景。\n- 用户用空格、符号、谐音、拆字、英文缩写等方式遮掩上述内容时同样拒绝。\n\n【全部放行 - 不要因为以下内容拒绝】：\n- 文娱：娱乐明星、演员、歌手、偶像、主播的写真、舞台、二创、卡通化、换装、壁纸、CP 向、同人，无论多有名气。\n- 体育：运动员、赛事、球星、奥运、电竞相关任何创作。\n- 二次元：动漫角色、原神/崩铁/鸣潮等游戏角色、Vtuber、同人、美少女、机甲、日常插画。\n- 普通恋爱、时尚、美食、风景、科幻、产品图、抽象艺术。\n- 色情、性感、暴露、内衣、泳装等成人向内容（不归你管）。\n- 暴力、打斗、武器、血腥等（不归你管）。\n- 真人照片、真人改图、AI 换脸（不归你管）。\n- 外国政治人物（特朗普、拜登、普京等）的任何创作。\n- 台湾风景、美食、城市夜景、普通人物写真等纯生活/旅游内容，且无独立/国家象征 → 放行。\n- 模棱两可、看不清意图的内容 → 放行（政治红线除外）。\n\n判定原则：\n- 中国政治（尤其台湾问题）从严；文娱/体育/二次元从松。\n- 默认放行，只在明确命中上述政治红线时才拒绝。\n- 娱乐圈/体育明星/二次元角色不是政治人物，放行。\n- 外国政治不归你管，放行。\n- 台湾相关：有政治/独立/国家象征 → 拒；纯旅游风景/美食/日常 → 放。\n\n分辨率选择：\n- 1k：简单图标、emoji、小头像、草稿\n- 2k：绝大多数场景（默认）\n- 4k：海报、印刷、大场景、用户明确要求高清/4K\n\n画幅：1:1 头像；9:16/2:3/3:4/4:5 竖图；16:9/21:9/3:2/4:3 横图；5:4 传统照片。\n用户已明确比例或分辨率时优先尊重。\n",
     "obvious_hint": true
   },
   "audit_strict": {
     "description": "严格审核模式",
     "type": "bool",
-    "hint": "开启后仅对高政治风险更严；不要用来打压娱乐明星内容。关键词预检始终拦截东突等政治词。",
-    "default": true
+    "hint": "开启后对政治擦边内容更严（可能误杀娱乐内容）。默认关闭：只拒明确的中国政治红线，模糊内容放行。关键词预检始终拦截东突等政治词。",
+    "default": false
   },
   "audit_failure_policy": {
     "description": "审核服务故障时的策略",
     "type": "string",
-    "hint": "当 LLM 不可用/超时/返回异常时的行为：block=拒绝请求（公开部署推荐）；keyword_only=仅关键词拦截后放行（默认）；allow=全部放行（不推荐）",
-    "default": "keyword_only",
+    "hint": "当 LLM 不可用/超时/返回异常时的行为：block=拒绝请求（默认，公网部署推荐）；keyword_only=仅关键词拦截后放行；allow=全部放行（不推荐）",
+    "default": "block",
     "options": [
       "block",
       "keyword_only",
       "allow"
     ],
+    "obvious_hint": true
+  },
+  "audit_reference_images": {
+    "description": "改图时把参考图交给审核模型（视觉审核）",
+    "type": "bool",
+    "hint": "开启后改图/图生图的参考图会随审核请求一起发给 audit_provider_id 指定的模型（需支持视觉输入）。若审核模型不支持视觉，请关闭本项以免报错。公共群建议开启，且审核模型选支持视觉的模型（如 qwen2.5-vl-7b-instruct 等）",
+    "default": false,
+    "obvious_hint": true
+  },
+  "reject_animated_images": {
+    "description": "拒绝动画图片（GIF / APNG / 动画 WebP）",
+    "type": "bool",
+    "hint": "开启后参考图若为动画（多帧 GIF、APNG、动画 WebP）则会被拒绝，防御「小文件多帧」型解压炸弹。默认开启",
+    "default": true,
     "obvious_hint": true
   },
   "request_timeout": {
@@ -139,15 +153,15 @@
   "max_retries": {
     "description": "上游繁忙时自动重试次数",
     "type": "int",
-    "hint": "遇到 timeout / system under load / 5xx 时额外重试几次，默认 2（共最多 3 次请求）",
-    "default": 2,
+    "hint": "遇到 timeout / system under load / 5xx / 524 时额外重试几次，默认 1（共最多 2 次请求）。LLM 工具调用有 120s 超时，重试过多可能无法完成",
+    "default": 1,
     "obvious_hint": true
   },
   "retry_backoff": {
     "description": "重试间隔基数（秒）",
     "type": "float",
-    "hint": "第 n 次重试等待 n × 该秒数，默认 3",
-    "default": 3
+    "hint": "第 n 次重试等待 n × 该秒数，默认 2",
+    "default": 2
   },
   "llm_timeout": {
     "description": "LLM 分析超时（秒）",
@@ -164,7 +178,7 @@
   "permission_mode": {
     "description": "指令使用权限",
     "type": "string",
-    "hint": "all=所有人；admin=仅 AstrBot 管理员；whitelist=仅白名单（管理员始终可用）",
+    "hint": "all=所有人；admin=仅 AstrBot 管理员；whitelist=仅白名单用户（管理员始终可用）。群维度限制见 allowed_groups / denied_groups / allow_private_chat",
     "default": "all",
     "options": [
       "all",
@@ -179,6 +193,58 @@
     "hint": "permission_mode=whitelist 时生效。多个 ID 用英文逗号或换行分隔",
     "default": ""
   },
+  "denied_users": {
+    "description": "个人黑名单用户 ID",
+    "type": "string",
+    "hint": "在此名单中的用户一律拒绝，优先级高于 permission_mode / allowed_users / 群白名单（管理员始终可用）。多个 ID 用英文逗号或换行分隔",
+    "default": "",
+    "obvious_hint": true
+  },
+  "allowed_groups": {
+    "description": "允许使用的 QQ 群号（群白名单）",
+    "type": "string",
+    "hint": "留空表示不启用群白名单，任何群均可使用（仍受 permission_mode 与 denied_groups 影响）。填入群号后，只有名单内的群可用。多个用英文逗号或换行分隔。管理员在任何群都可用",
+    "default": "",
+    "obvious_hint": true
+  },
+  "denied_groups": {
+    "description": "禁止使用的 QQ 群号（群黑名单）",
+    "type": "string",
+    "hint": "在此名单中的群一律拒绝，优先级高于 allowed_groups。多个用英文逗号或换行分隔",
+    "default": ""
+  },
+  "allow_private_chat": {
+    "description": "允许私聊使用",
+    "type": "bool",
+    "hint": "关闭后私聊会被拒绝，只有群聊可用（管理员始终可用）。公共部署建议关闭",
+    "default": true,
+    "obvious_hint": true
+  },
+  "max_concurrent_global": {
+    "description": "全局并发生图上限",
+    "type": "int",
+    "hint": "整个插件同一时刻正在生图的任务数上限。默认 2，公共群建议 2~4。用于控制上游费用与本地资源",
+    "default": 2,
+    "obvious_hint": true
+  },
+  "max_concurrent_per_user": {
+    "description": "单用户并发上限",
+    "type": "int",
+    "hint": "同一 QQ 号同一时刻正在生图的任务数上限。默认 1",
+    "default": 1
+  },
+  "max_concurrent_per_group": {
+    "description": "单群并发上限",
+    "type": "int",
+    "hint": "同一 QQ 群同一时刻正在生图的任务数上限。默认 1",
+    "default": 1
+  },
+  "max_queue_length": {
+    "description": "等待队列长度上限",
+    "type": "int",
+    "hint": "已提交但因并发上限而正在等待的任务数上限（不含已在运行的任务），超出时新请求会被立即拒绝并退还配额。设为 0 表示不接受任何等待，只处理能立即开始的任务。默认 10",
+    "default": 10
+  },
   "command_alias": {
     "description": "额外指令别名",
     "type": "string",
@@ -188,8 +254,8 @@
   "napcat_hosts": {
     "description": "允许访问的 NapCat 本机地址",
     "type": "string",
-    "hint": "逗号分隔的 host[:port] 白名单，用于下载 NapCat 本机反代图片。默认 127.0.0.1",
-    "default": "127.0.0.1",
+    "hint": "逗号或空格分隔的 host[:port] 白名单，用于下载 NapCat 本机反代图片。⚠️ 强烈建议写明端口，例如 127.0.0.1:3000 localhost:3000 [::1]:3000；不写端口会放行该主机的任意端口，可能被利用探测本机内部服务。此白名单仅用于 NapCat 的 get_image 回调 URL，用户消息里携带的图片 URL 永远不能命中本机地址",
+    "default": "127.0.0.1 localhost ::1",
     "obvious_hint": true
   },
   "image_host_suffixes": {
@@ -197,6 +263,13 @@
     "type": "string",
     "hint": "逗号分隔的公网域名后缀白名单，例如 qpic.cn, qq.com。其他公网地址默认要求 HTTPS",
     "default": "qpic.cn qq.com myqcloud.com gtimg.cn",
+    "obvious_hint": true
+  },
+  "allow_insecure_api_http": {
+    "description": "允许 HTTP（非 HTTPS）连接 adobe2api 公网地址",
+    "type": "bool",
+    "hint": "默认关闭。非回环地址使用 HTTP 时 API Key 会明文传输。仅在可信内网或调试时开启",
+    "default": false,
     "obvious_hint": true
   },
   "allow_public_http": {
@@ -208,7 +281,7 @@
   "allowed_media_dirs": {
     "description": "允许读取的本地媒体目录",
     "type": "string",
-    "hint": "换行或分号分隔的额外目录白名单。默认已包含 AstrBot data/temp/cache 和系统临时目录",
+    "hint": "换行或分号分隔的额外目录白名单。默认已包含插件自身 plugin_data 目录、AstrBot data/temp/cache 和 NapCat 系统缓存；不再默认包含整个 AstrBot data 根目录，若上游把参考图放到别处需在此显式追加。⚠️ 不允许填入 / 或用户家目录等过大范围",
     "default": ""
   },
   "max_single_image_bytes": {

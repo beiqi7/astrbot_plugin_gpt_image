@@ -59,7 +59,7 @@ class DailyQuota:
         if self._data.get("date") != today:
             self._data = {"date": today, "users": {}}
 
-    def _save(self) -> None:
+    def _save(self) -> bool:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
@@ -68,10 +68,12 @@ class DailyQuota:
                 encoding="utf-8",
             )
             tmp.replace(self.path)
+            return True
         except Exception as e:
             logger.warning(
                 f"[gpt_image] quota persist failed (in-memory only): {e}"
             )
+            return False
 
     def get_used(self, user_id: str) -> int:
         with self._lock:
@@ -112,34 +114,55 @@ class DailyQuota:
             self._save()
             return cur
 
-    def reserve(self, user_id: str, limit: int) -> tuple[bool, int]:
+    def reserve(self, user_id: str, limit: int) -> tuple[bool, int, str]:
         """Atomically check + pre-deduct 1 from the daily quota.
 
-        Returns (ok, new_used_count).
+        Returns (ok, new_used_count, reservation_date).
         limit < 0 means unlimited (always ok, no deduction).
-        On upstream failure, caller should call refund().
+        On upstream failure, caller should call refund(reservation_date=...).
         """
         if limit < 0:
-            return True, self.get_used(user_id)
+            return True, self.get_used(user_id), today_key()
         with self._lock:
             self._roll_if_needed()
             uid = str(user_id or "").strip() or "unknown"
+            res_date = str(self._data.get("date") or today_key())
             try:
                 cur = int(self._data["users"].get(uid, 0))
             except Exception:
                 cur = 0
             cur = max(0, cur)
             if cur >= int(limit):
-                return False, cur
+                return False, cur, res_date
             cur += 1
             self._data["users"][uid] = cur
-            self._save()
-            return True, cur
+            if not self._save():
+                # Roll back in-memory count on persistence failure
+                self._data["users"][uid] = cur - 1
+                logger.error(
+                    "[gpt_image] quota reserve: persist failed, "
+                    "rolled back reservation"
+                )
+                return False, cur - 1, res_date
+            return True, cur, res_date
 
-    def refund(self, user_id: str, n: int = 1) -> int:
-        """Refund n reservations (e.g. upstream generation failed)."""
+    def refund(
+        self, user_id: str, n: int = 1, *, reservation_date: str = ""
+    ) -> int:
+        """Refund n reservations (e.g. upstream generation failed).
+
+        If reservation_date is given and differs from current date,
+        the refund is skipped (midnight rollover protection).
+        """
         with self._lock:
             self._roll_if_needed()
+            current_date = str(self._data.get("date") or today_key())
+            if reservation_date and reservation_date != current_date:
+                logger.info(
+                    f"[gpt_image] refund skipped: reservation date "
+                    f"{reservation_date} != current {current_date}"
+                )
+                return self.get_used(user_id)
             uid = str(user_id or "").strip() or "unknown"
             try:
                 cur = int(self._data["users"].get(uid, 0))

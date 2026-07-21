@@ -15,7 +15,14 @@ from astrbot.api import logger
 from .security import (
     DEFAULT_MAX_OUTPUT_BYTES,
     MAX_HTTP_CHUNK,
+    MAX_RESPONSE_BYTES,
     SecurityError,
+    UrlPolicy,
+    ValidatingResolver,
+    check_image_pixel_limit,
+    is_animated_image,
+    is_image_bytes,
+    redact_url,
     safe_b64decode,
     sniff_image_mime,
 )
@@ -58,7 +65,7 @@ def classify_upstream_error(status: int | None, body: str = "") -> tuple[bool, s
     if status == 429 or "rate limit" in text or "too many" in text:
         return True, "请求过于频繁，请稍后再试。"
 
-    if status in (500, 502, 503, 504):
+    if status in (500, 502, 503, 504, 524):
         return True, "上游服务暂时不可用，请稍后再试。"
 
     if status in (401, 403):
@@ -80,6 +87,7 @@ class Adobe2APIClient:
         timeout: float = 300.0,
         max_retries: int = 2,
         retry_backoff: float = 3.0,
+        url_policy: UrlPolicy | None = None,
     ):
         self.base_url = (base_url or "").strip().rstrip("/")
         self.api_key = (api_key or "").strip()
@@ -87,9 +95,64 @@ class Adobe2APIClient:
         self.max_retries = max(0, int(max_retries or 0))
         self.retry_backoff = max(0.5, float(retry_backoff or 3.0))
         self._session: aiohttp.ClientSession | None = None
+        self._url_policy = url_policy
+        self._output_url_policy = url_policy
+        self._max_output_bytes = DEFAULT_MAX_OUTPUT_BYTES
+        self._allow_insecure_http = False
+
+    def set_allow_insecure_http(self, val: bool) -> None:
+        self._allow_insecure_http = bool(val)
+
+    def set_max_output_bytes(self, n: int) -> None:
+        self._max_output_bytes = max(1024, int(n))
+
+    def set_output_url_policy(self, policy: "UrlPolicy | None") -> None:
+        """Set stricter policy for output image downloads (no loopback)."""
+        self._output_url_policy = policy
 
     def configured(self) -> bool:
-        return bool(self.base_url)
+        if not self.base_url:
+            return False
+        parsed = urlparse(self.base_url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        if not parsed.hostname:
+            return False
+        # Reject URLs that carry credentials or extra components: they
+        # have no legitimate use for an API endpoint and would silently
+        # leak into logs / error messages.
+        if parsed.username or parsed.password:
+            logger.error(
+                f"[gpt_image] base_url {redact_url(self.base_url)} contains "
+                "userinfo credentials; refusing to start. Move the API key "
+                "to the api_key field."
+            )
+            return False
+        if parsed.query or parsed.fragment:
+            logger.error(
+                f"[gpt_image] base_url {redact_url(self.base_url)} must not "
+                "contain query or fragment; refusing to start."
+            )
+            return False
+        if parsed.scheme == "http":
+            host = parsed.hostname.lower()
+            is_loopback = host in ("127.0.0.1", "localhost", "::1")
+            if not is_loopback and not self._allow_insecure_http:
+                logger.error(
+                    f"[gpt_image] base_url {redact_url(self.base_url)} uses "
+                    f"HTTP to non-loopback host: blocked "
+                    f"(set allow_insecure_api_http=true to override)"
+                )
+                return False
+            if not is_loopback and self._allow_insecure_http:
+                logger.warning(
+                    f"[gpt_image] base_url {redact_url(self.base_url)} uses "
+                    f"insecure HTTP: API key will be sent in cleartext"
+                )
+        return True
+
+    def set_url_policy(self, policy: UrlPolicy | None) -> None:
+        self._url_policy = policy
 
     def _auth_headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
@@ -105,10 +168,41 @@ class Adobe2APIClient:
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            # session 默认短超时，长等待由单次请求 timeout 覆盖
             timeout = aiohttp.ClientTimeout(total=60, connect=30)
-            self._session = aiohttp.ClientSession(timeout=timeout)
+            if self._url_policy is not None:
+                # Fail-closed: if resolver init fails, refuse to create session
+                resolver = ValidatingResolver(self._url_policy)
+                connector = aiohttp.TCPConnector(resolver=resolver, limit=0)
+                self._session = aiohttp.ClientSession(
+                    timeout=timeout, connector=connector
+                )
+            else:
+                self._session = aiohttp.ClientSession(timeout=timeout)
         return self._session
+
+    @staticmethod
+    async def _read_text_limited(
+        resp: aiohttp.ClientResponse, max_bytes: int = MAX_RESPONSE_BYTES
+    ) -> str:
+        """Read response body as text with size limit (streaming)."""
+        declared = resp.headers.get("Content-Length", "")
+        if declared and declared.isdigit() and int(declared) > max_bytes:
+            raise Adobe2APIError(
+                f"response too large: {declared} > {max_bytes}",
+                user_message="服务返回数据过大。",
+            )
+        buf = bytearray()
+        async for chunk in resp.content.iter_chunked(MAX_HTTP_CHUNK):
+            buf.extend(chunk)
+            if len(buf) > max_bytes:
+                raise Adobe2APIError(
+                    f"response stream exceeded {max_bytes}B",
+                    user_message="服务返回数据过大。",
+                )
+        try:
+            return buf.decode("utf-8", errors="replace")
+        except Exception:
+            return buf.decode("latin-1", errors="replace")
 
     async def close(self) -> None:
         if self._session and not self._session.closed:
@@ -158,8 +252,6 @@ class Adobe2APIClient:
                     f"retry in {delay:.1f}s status={e.status}"
                 )
                 await asyncio.sleep(delay)
-            except Exception:
-                raise
 
         if last_err:
             raise last_err
@@ -213,24 +305,62 @@ class Adobe2APIClient:
 
         try:
             async with session.post(
-                endpoint, json=payload, headers=headers, timeout=req_timeout
+                endpoint, json=payload, headers=headers, timeout=req_timeout,
+                allow_redirects=False,
             ) as resp:
-                text = await resp.text()
+                if resp.status in (301, 302, 303, 307, 308):
+                    raise Adobe2APIError(
+                        f"API endpoint returned redirect {resp.status}, "
+                        f"expected direct response",
+                        user_message="服务配置异常，请联系管理员。",
+                    )
+                # Dynamic response limit: base64 expands ~33%, add JSON overhead
+                resp_limit = max(
+                    MAX_RESPONSE_BYTES,
+                    int(self._max_output_bytes * 4 / 3) + 1024 * 1024,
+                )
+                text = await self._read_text_limited(resp, max_bytes=resp_limit)
                 if resp.status >= 400:
                     retryable, user_msg = classify_upstream_error(resp.status, text)
+                    import hashlib as _hl
+
+                    body_hash = _hl.sha256(
+                        text.encode("utf-8", "ignore")
+                    ).hexdigest()[:12]
+                    logger.error(
+                        f"[gpt_image] generate failed HTTP {resp.status} "
+                        f"len={len(text)} hash={body_hash} "
+                        f"retryable={retryable}"
+                    )
                     raise Adobe2APIError(
-                        f"生图失败 HTTP {resp.status}: {text[:500]}",
+                        f"generate failed HTTP {resp.status} "
+                        f"(len={len(text)} hash={body_hash})",
                         status=resp.status,
                         body=text,
                         retryable=retryable,
                         user_message=user_msg,
                     )
-                try:
-                    data = await resp.json(content_type=None)
-                except Exception:
-                    import json
+                # Parse JSON from already-read text (resp body is consumed
+                # by _read_text_limited, so resp.json() would return empty)
+                import json
 
+                try:
                     data = json.loads(text)
+                except Exception:
+                    data = None
+                if not isinstance(data, dict):
+                    import hashlib as _hl
+
+                    digest = _hl.sha256(text.encode("utf-8", "ignore")).hexdigest()[:12]
+                    logger.warning(
+                        f"[gpt_image] upstream non-JSON response "
+                        f"len={len(text)} hash={digest}"
+                    )
+                    raise Adobe2APIError(
+                        "upstream returned non-JSON or empty response",
+                        status=resp.status,
+                        user_message="上游返回异常，请稍后再试。",
+                    )
         except Adobe2APIError:
             raise
         except asyncio.TimeoutError as e:
@@ -250,6 +380,11 @@ class Adobe2APIClient:
         return self._extract_image_result(data, model)
 
     def _extract_image_result(self, data: dict[str, Any], model: str) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            raise Adobe2APIError(
+                "upstream response is not a JSON object",
+                user_message="上游返回异常，请稍后再试。",
+            )
         url: str | None = None
         b64: str | None = None
 
@@ -287,9 +422,15 @@ class Adobe2APIClient:
             url = urljoin(self.base_url + "/", url.lstrip("/"))
 
         if not url and not b64:
+            import hashlib as _hl
+
+            body_hash = _hl.sha256(
+                str(data).encode("utf-8", "ignore")
+            ).hexdigest()[:12]
             raise Adobe2APIError(
-                f"响应中未找到图片: {str(data)[:400]}",
+                f"响应中未找到图片 (hash={body_hash})",
                 body=str(data)[:2000],
+                user_message="上游未返回图片，请稍后再试。",
             )
 
         return {"url": url, "b64": b64, "model": data.get("model") or model, "raw": data}
@@ -320,6 +461,32 @@ class Adobe2APIClient:
             return data_url.split(",", 1)[1]
         return data_url
 
+    def _download_headers(self, url: str) -> dict[str, str]:
+        """Compute auth headers for a download URL.
+
+        Only sends Authorization when the URL is strictly same-origin
+        (scheme + host + port) as base_url. Prevents API key leakage
+        via cross-origin redirects. Normalizes default ports.
+        """
+        try:
+            target = urlparse(url)
+            base = urlparse(self.base_url)
+            tp = target.port or (443 if target.scheme == "https" else 80)
+            bp = base.port or (443 if base.scheme == "https" else 80)
+            if (
+                target.scheme == base.scheme
+                and target.hostname == base.hostname
+                and tp == bp
+                and self.api_key
+            ):
+                return {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "X-API-Key": self.api_key,
+                }
+        except Exception:
+            pass
+        return {}
+
     async def download_bytes(
         self,
         url: str,
@@ -327,45 +494,66 @@ class Adobe2APIClient:
         timeout: float = 60.0,
         max_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
     ) -> bytes:
-        """Download bytes with streaming + size limit.
+        """Download bytes with SSRF validation, manual redirects, and size limit."""
+        if self._output_url_policy is not None:
+            ok, reason = await self._output_url_policy.validate_async(url)
+            if not ok:
+                raise Adobe2APIError(
+                    f"output URL rejected: {reason}",
+                    user_message="生成结果地址不安全，已拒绝下载。",
+                )
 
-        Raises SecurityError if the response exceeds max_bytes.
-        """
         session = await self._get_session()
-        headers = {}
-        try:
-            host = urlparse(url).netloc
-            base_host = urlparse(self.base_url).netloc
-            if host == base_host and self.api_key:
-                headers["Authorization"] = f"Bearer {self.api_key}"
-        except Exception:
-            pass
-
         req_timeout = aiohttp.ClientTimeout(total=max(5.0, float(timeout)), connect=15)
-        async with session.get(
-            url, headers=headers, timeout=req_timeout, allow_redirects=True
-        ) as resp:
-            if resp.status >= 400:
-                text = await resp.text()
-                raise Adobe2APIError(
-                    f"download failed HTTP {resp.status}: {text[:200]}",
-                    status=resp.status,
-                )
-            declared = resp.headers.get("Content-Length", "")
-            if declared and declared.isdigit() and int(declared) > max_bytes:
-                raise Adobe2APIError(
-                    f"result image too large: {declared} > {max_bytes}",
-                    user_message="生成结果过大，请联系管理员检查。",
-                )
-            buf = bytearray()
-            async for chunk in resp.content.iter_chunked(MAX_HTTP_CHUNK):
-                buf.extend(chunk)
-                if len(buf) > max_bytes:
+        current = url
+        max_redirects = 5
+        for _ in range(max_redirects + 1):
+            if self._output_url_policy is not None:
+                ok, reason = await self._output_url_policy.validate_async(current)
+                if not ok:
                     raise Adobe2APIError(
-                        f"result image stream exceeded {max_bytes}B",
+                        f"redirect URL rejected: {reason}",
+                        user_message="生成结果地址不安全，已拒绝下载。",
+                    )
+            # Recompute auth headers per-hop to prevent cross-origin key leakage
+            hop_headers = self._download_headers(current)
+            async with session.get(
+                current, headers=hop_headers, timeout=req_timeout, allow_redirects=False
+            ) as resp:
+                if resp.status in (301, 302, 303, 307, 308):
+                    loc = resp.headers.get("Location", "")
+                    if not loc:
+                        raise Adobe2APIError("redirect without Location")
+                    current = urljoin(current, loc)
+                    continue
+                if resp.status >= 400:
+                    text = await self._read_text_limited(resp, max_bytes=65536)
+                    import hashlib as _hl
+
+                    body_hash = _hl.sha256(
+                        text.encode("utf-8", "ignore")
+                    ).hexdigest()[:12]
+                    raise Adobe2APIError(
+                        f"download failed HTTP {resp.status} "
+                        f"(len={len(text)} hash={body_hash})",
+                        status=resp.status,
+                    )
+                declared = resp.headers.get("Content-Length", "")
+                if declared and declared.isdigit() and int(declared) > max_bytes:
+                    raise Adobe2APIError(
+                        f"result image too large: {declared} > {max_bytes}",
                         user_message="生成结果过大，请联系管理员检查。",
                     )
-            return bytes(buf)
+                buf = bytearray()
+                async for chunk in resp.content.iter_chunked(MAX_HTTP_CHUNK):
+                    buf.extend(chunk)
+                    if len(buf) > max_bytes:
+                        raise Adobe2APIError(
+                            f"result image stream exceeded {max_bytes}B",
+                            user_message="生成结果过大，请联系管理员检查。",
+                        )
+                return bytes(buf)
+        raise Adobe2APIError("too many redirects")
 
     async def save_result_image(
         self,
@@ -374,11 +562,49 @@ class Adobe2APIClient:
         filename_stem: str,
         *,
         max_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+        max_pixels: int = 40_000_000,
     ) -> Path:
-        """Save the result image to dest_dir with size limit."""
+        """Save the result image to dest_dir with size + signature + pixel limits."""
         dest_dir.mkdir(parents=True, exist_ok=True)
         b64 = result.get("b64")
         url = result.get("url")
+
+        def _validate(raw: bytes) -> bytes:
+            if not is_image_bytes(raw):
+                raise Adobe2APIError(
+                    "result is not a valid image",
+                    user_message="生成结果不是有效图片。",
+                )
+            if not check_image_pixel_limit(raw, max_pixels):
+                raise Adobe2APIError(
+                    f"result pixels exceed limit {max_pixels}",
+                    user_message="生成结果图片过大，请联系管理员检查。",
+                )
+            if is_animated_image(raw):
+                raise Adobe2APIError(
+                    "result is an animated image (GIF/APNG/animated WebP)",
+                    user_message="生成结果为动画图片，已被拒绝。",
+                )
+            return raw
+
+        def _ext(raw: bytes, fallback_url: str = "") -> str:
+            mime = sniff_image_mime(raw)
+            ext_map = {
+                "image/jpeg": ".jpg",
+                "image/webp": ".webp",
+                "image/gif": ".gif",
+                "image/png": ".png",
+            }
+            if mime in ext_map:
+                return ext_map[mime]
+            lower = str(fallback_url or "").lower()
+            if ".jpg" in lower or ".jpeg" in lower:
+                return ".jpg"
+            if ".webp" in lower:
+                return ".webp"
+            if ".gif" in lower:
+                return ".gif"
+            return ".png"
 
         if b64:
             try:
@@ -388,7 +614,8 @@ class Adobe2APIClient:
                     f"result b64 too large or invalid: {e}",
                     user_message="生成结果过大，请联系管理员检查。",
                 ) from e
-            path = dest_dir / f"{filename_stem}.png"
+            _validate(raw)
+            path = dest_dir / f"{filename_stem}{_ext(raw)}"
             path.write_bytes(raw)
             return path
 
@@ -401,7 +628,8 @@ class Adobe2APIClient:
                     f"result data URL too large: {e}",
                     user_message="生成结果过大，请联系管理员检查。",
                 ) from e
-            path = dest_dir / f"{filename_stem}.png"
+            _validate(raw)
+            path = dest_dir / f"{filename_stem}{_ext(raw)}"
             path.write_bytes(raw)
             return path
 
@@ -409,19 +637,8 @@ class Adobe2APIClient:
             content = await self.download_bytes(
                 str(url), max_bytes=max_bytes
             )
-            ext = ".png"
-            mime = sniff_image_mime(content)
-            if mime == "image/jpeg":
-                ext = ".jpg"
-            elif mime == "image/webp":
-                ext = ".webp"
-            else:
-                lower = str(url).lower()
-                if ".jpg" in lower or ".jpeg" in lower:
-                    ext = ".jpg"
-                elif ".webp" in lower:
-                    ext = ".webp"
-            path = dest_dir / f"{filename_stem}{ext}"
+            _validate(content)
+            path = dest_dir / f"{filename_stem}{_ext(content, str(url))}"
             path.write_bytes(content)
             return path
 

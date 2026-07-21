@@ -204,14 +204,14 @@ firefly-gpt-image-4k-1x1
 | `enable_keyword_filter` | `true` | 启用关键词预检 |
 | `audit_provider_id` | 空 | 审核和参数选择使用的独立 LLM Provider ID |
 | `audit_prompt` | 内置提示词 | 审核与参数选择系统提示词 |
-| `audit_strict` | `true` | 对高政治风险启用更严格判定 |
-| `audit_failure_policy` | `keyword_only` | LLM 审核失败时的处理策略 |
+| `audit_strict` | `false` | 对政治擦边内容更严（可能误杀娱乐内容），默认关闭 |
+| `audit_failure_policy` | `block` | LLM 审核失败时的处理策略 |
 | `llm_timeout` | `45` | LLM 分析超时，单位：秒 |
 
 `audit_failure_policy` 可选值：
 
-- `block`：审核服务异常时拒绝请求，适合公开部署
-- `keyword_only`：仅执行关键词预检，通过后继续，默认值
+- `block`：审核服务异常时拒绝请求，默认值，适合公开部署
+- `keyword_only`：仅执行关键词预检，通过后继续
 - `allow`：审核服务异常时直接放行，不建议公开部署使用
 
 #### 使用独立审核模型（推荐）
@@ -225,8 +225,8 @@ firefly-gpt-image-4k-1x1
 | 配置项 | 默认值 | 说明 |
 |---|---:|---|
 | `request_timeout` | `300` | 单次生图请求超时，单位：秒 |
-| `max_retries` | `2` | 可重试错误的额外重试次数，默认最多请求 3 次 |
-| `retry_backoff` | `3` | 线性重试间隔基数，单位：秒 |
+| `max_retries` | `1` | 可重试错误的额外重试次数，默认最多请求 2 次 |
+| `retry_backoff` | `2` | 线性重试间隔基数，单位：秒 |
 | `max_output_bytes` | `31457280` | 生成结果最大体积，默认 30 MiB |
 
 ### 权限与额度
@@ -235,6 +235,7 @@ firefly-gpt-image-4k-1x1
 |---|---:|---|
 | `permission_mode` | `all` | `all` / `admin` / `whitelist` |
 | `allowed_users` | 空 | 白名单用户 ID，使用逗号或换行分隔 |
+| `denied_users` | 空 | 个人黑名单用户 ID，优先级最高（管理员除外），使用逗号或换行分隔 |
 | `command_alias` | 空 | 额外指令别名，使用逗号分隔 |
 
 额度规则：
@@ -254,13 +255,13 @@ data/plugin_data/astrbot_plugin_gpt_image/daily_quota.json
 
 | 配置项 | 默认值 | 说明 |
 |---|---:|---|
-| `napcat_hosts` | `127.0.0.1` | 允许访问的 NapCat 本机 `host[:port]` 白名单 |
+| `napcat_hosts` | `127.0.0.1 localhost ::1` | 允许访问的 NapCat 本机 `host[:port]` 白名单，**强烈建议写明端口**（如 `127.0.0.1:3000 localhost:3000`） |
 | `image_host_suffixes` | `qpic.cn qq.com myqcloud.com gtimg.cn` | 允许的图床域名后缀 |
 | `allow_public_http` | `false` | 是否允许通过 HTTP 下载公网图片，不建议开启 |
 | `allowed_media_dirs` | 空 | 允许读取的额外本地媒体目录 |
 | `max_single_image_bytes` | `15728640` | 单张参考图最大体积，默认 15 MiB |
 
-默认已允许 AstrBot 的 `data`、`temp`、`cache` 目录及系统临时目录。请仅添加可信目录，不要将整个文件系统加入白名单。
+默认已允许插件自身 `plugin_data` 目录、AstrBot 的 `temp`、`cache` 子目录及 NapCat 系统缓存目录；不再默认包含整个 AstrBot data 根目录，避免跨插件图片泄露。请仅添加可信子目录，不要将 `/`、用户家目录或整个磁盘加入白名单（会被自动忽略）。
 
 ## 常见问题
 
