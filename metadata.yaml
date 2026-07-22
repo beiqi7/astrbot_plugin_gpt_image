@@ -1,6 +1,6 @@
 name: astrbot_plugin_gpt_image
-display_name: GPT Image 生图改图
-desc: 通过 adobe2api 调用 Firefly GPT Image（firefly-gpt-image-*），支持文生图/改图、LLM 自动选分辨率、输入审核、每日次数限制。
+display_name: GPT Image 生图改图 (adobe2api)
+desc: 通过 adobe2api 调用 Adobe Firefly GPT Image（firefly-gpt-image-*），支持文生图/改图、自动画幅、输入审核、权限控制与每日额度。需先部署 adobe2api。
 version: v1.6.0
 author: serenite
 repo: https://github.com/beiqi7/astrbot_plugin_gpt_image

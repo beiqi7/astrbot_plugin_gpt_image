@@ -5,7 +5,9 @@
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](./LICENSE)
 
-面向 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 的 GPT Image 生图与改图插件。通过 [leik1000/adobe2api](https://github.com/leik1000/adobe2api) 调用 `firefly-gpt-image-*` 模型，支持参考图编辑、自动画幅、输入审核、权限控制、每日额度与并发队列。
+面向 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 的 GPT Image 生图与改图插件。
+
+**本插件依赖 [adobe2api](https://github.com/leik1000/adobe2api) 作为后端服务**——adobe2api 是一个将 Adobe Firefly 的 `firefly-gpt-image-*` 模型封装为 OpenAI 兼容接口的工具，插件通过其 `/v1/images/generations` 和 `/v1/chat/completions` 端点完成文生图与改图。请先部署 adobe2api 再使用本插件。
 
 > 当前版本：**v1.6.0**
 > Python 依赖：`aiohttp>=3.9.0,<4.0.0`
@@ -52,9 +54,9 @@ LLM 只负责审核和参数选择。实际提交给生图模型的 `prompt` 始
 
 ## 快速开始
 
-### 1. 准备 adobe2api
+### 1. 部署 adobe2api（前置依赖）
 
-先部署并确认 [adobe2api](https://github.com/leik1000/adobe2api) 可正常访问，记录：
+本插件不直接调用 Adobe Firefly，而是通过 [adobe2api](https://github.com/leik1000/adobe2api) 的 OpenAI 兼容接口转发。请先部署 adobe2api 并确认可正常访问，记录：
 
 - 服务地址，例如 `http://127.0.0.1:6001`
 - API Key（如果服务端启用了鉴权）
@@ -211,26 +213,16 @@ firefly-gpt-image-4k-1x1
 
 ### 审核
 
+插件内置输入审核，包括关键词预检（政治敏感词硬拦截，独立于 LLM 审核开关）和 LLM 审核（可配置独立 Provider、故障降级策略、视觉审核参考图）。审核规则主要面向中国大陆政治安全。完整配置项见 `_conf_schema.json`。
+
 | 配置项 | 默认值 | 说明 |
 |---|---:|---|
 | `enable_audit` | `true` | 启用 LLM 输入审核 |
 | `enable_keyword_filter` | `true` | 启用关键词预检 |
 | `audit_provider_id` | 空 | 单独指定审核模型 Provider ID |
-| `audit_prompt` | 内置提示词 | 审核与参数选择系统提示词，留空用内置默认 |
-| `audit_strict` | `false` | 对政治擦边内容从严 |
-| `audit_reference_images` | `false` | 将参考图同时交给视觉审核模型 |
-| `audit_failure_policy` | `block` | 审核服务异常时的策略 |
-| `llm_timeout` | `45` | LLM 分析超时，单位为秒 |
+| `audit_failure_policy` | `block` | 审核服务异常时的策略（`block` / `keyword_only` / `allow`） |
 
-`audit_failure_policy`：
-
-- `block`：审核服务异常时拒绝请求，适合公开部署
-- `keyword_only`：仅执行关键词预检，通过后继续
-- `allow`：审核异常时直接放行，不建议公开部署
-
-> 关键词预检独立于 `enable_audit`，只要 `enable_keyword_filter` 为 `true` 就会执行，覆盖东突、台独等政治敏感词。
->
-> 内置审核规则主要面向中国大陆政治安全（尤其台湾问题从严），文娱、体育、二次元等内容从松。不等同于完整的未成年人、色情、暴力、隐私或换脸审核。公开部署时，应结合上游模型策略和平台规则补充审核。
+> 关键词预检独立于 `enable_audit`，只要 `enable_keyword_filter` 为 `true` 就会执行。
 
 ### 权限与额度
 
